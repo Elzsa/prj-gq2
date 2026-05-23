@@ -4,3 +4,6 @@ openpyxl
 scipy
 statsmodels
 matplotlib
+scikit-learn
+gplearn
+torch
