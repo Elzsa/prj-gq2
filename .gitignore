@@ -1,5 +1,14 @@
+# Environnements virtuels
 .venv/
+venv/
+
+# Cache Python
 __pycache__/
+*.pyc
+
+# IDE
+.vscode/
 .DS_Store
-*.xlsx
+
+# Fichiers temporaires GAS
 *.csv

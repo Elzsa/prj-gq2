@@ -7,3 +7,10 @@ matplotlib
 scikit-learn
 gplearn
 torch
+
+arch
+pyarrow
+jupyter
+pathlib
+pytest
+tqdm
