@@ -11,7 +11,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from config.splits import TEST_START, TEST_END
+from config.splits import TRAIN_START, TRAIN_END, TEST_START, TEST_END
 
 # noms des cinq facteurs Fama-French
 FACTEURS = ["MKT", "SMB", "HML", "RMW", "CMA"]
@@ -75,8 +75,9 @@ def charger_previsions_individuelles(verbose: bool = True) -> dict:
         # le papier annonce 328, l'ecart vient des variantes non implementees (nonlinear.py)
         df_complet = pd.concat(objs=[df_lin, df_nonlin], axis=1)
 
-        # filtrage sur la periode TEST uniquement
-        masque = (df_complet.index >= TEST_START) & (df_complet.index <= TEST_END)
+        # periode in-sample complete TRAIN+TEST (1965-1999) pour la PCA
+        # papier Section 3.1 : "individual forecasts in-sample"
+        masque = (df_complet.index >= TRAIN_START) & (df_complet.index <= TEST_END)
         df_complet = df_complet.loc[masque]
 
         previsions_par_facteur[facteur] = df_complet
@@ -143,9 +144,11 @@ def identifier_meilleur_modele(df_previsions: pd.DataFrame, serie_reelle: pd.Ser
 # 4. Appliquer PCA avec n_components=0.95 (seuil du papier)
 # 5. Les composantes retenues sont les inputs de SVR, SC-SVR, DMA
 #
-# Ambiguite du papier : la PCA est appliquee sur les previsions in-sample ou TEST ?
-# Decision retenue : periode TEST (1984-1999), car c'est la periode d'evaluation
-# des modeles individuels et de selection des inputs pour les combinaisons.
+# Le papier dit "individual forecasts in-sample" (Section 3.1).
+# Decision retenue : periode TRAIN+TEST (1965-1999), soit 420 observations.
+# La PCA sur la periode complete garantit une structure de correlation plus stable
+# et permet aux modeles non lineaires (estimes sur TRAIN) d'avoir des fittedvalues
+# sur toute la periode in-sample.
 
 def appliquer_pca_facteur(df_previsions: pd.DataFrame, nom_facteur: str, verbose: bool = True) -> tuple:
     """Applique la PCA sur les previsions d'un facteur et retourne (composantes, objet PCA, scaler, colonnes_retenues)."""
@@ -371,6 +374,13 @@ def generer_table_3(pca_objects: dict, cols_valides_par_facteur: dict, meilleur_
             # deduplification : un modele ne peut representer qu'une seule composante
             if nom_modele not in noms_retenus:
                 noms_retenus.append(nom_modele)
+
+        # si le meilleur modele n'est pas dans la liste PCA, on l'ajoute en premier
+        # cela garantit que [BEST] apparait toujours dans la Table 3
+        if nom_best not in noms_retenus:
+            noms_retenus.insert(0, nom_best)
+            if verbose:
+                print(f"  {facteur} : meilleur modele {nom_best} force en tete (absent des loadings PCA)")
 
         # marquer le meilleur modele avec [BEST] (gras dans le papier)
         noms_affiches = [f"{n} [BEST]" if n == nom_best else n for n in noms_retenus]
