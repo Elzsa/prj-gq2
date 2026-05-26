@@ -13,8 +13,6 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
-from scipy.optimize import minimize
-
 import torch
 import torch.nn as nn
 
@@ -725,53 +723,7 @@ def prevoir_gep(serie: pd.Series, taille_tete: int = 6, n_genes: int = 3, n_pop:
 
 
 # ==============================================================================
-# SECTION 10 : STAR (Smooth Transition AutoRegressive)
-# ==============================================================================
-# Papier Section 3.1 : STAR mentionne dans le pool non lineaire.
-# LSTAR logistique : deux regimes AR avec transition douce via fonction logistique.
-# Decision retenue : p=1 lag AR, variable de transition s_t = y_{t-1}.
-# Ambiguite signalee : le papier ne precise pas l'ordre ni la variable de transition.
-
-def _lstar_prevision(params: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """Calcule les previsions LSTAR pour des parametres donnes."""
-    phi1_0, phi1_1, phi2_0, phi2_1, gamma, c = params
-    s     = X[:, 0]  # variable de transition = premier lag
-    G     = 1.0 / (1.0 + np.exp(-gamma * (s - c)))
-    y_hat = (phi1_0 + phi1_1 * X[:, 0]) * (1 - G) + (phi2_0 + phi2_1 * X[:, 0]) * G
-    return y_hat
-
-
-def prevoir_star(serie: pd.Series, n_lags_ar: int = 1, verbose: bool = True) -> pd.Series:
-    """Prevoit 1 pas en avant par LSTAR estime sur TRAIN, previsions sur TEST."""
-    X_train, y_train, X_test, _, idx_test = preparer_train_test(serie=serie, n_lags=max(n_lags_ar, 1))
-
-    scaler     = StandardScaler()
-    X_train_sc = scaler.fit_transform(X_train)
-    X_test_sc  = scaler.transform(X_test)
-
-    def objectif(params: np.ndarray) -> float:
-        """Critere MSE a minimiser pour l'estimation LSTAR."""
-        return float(np.mean((_lstar_prevision(params=params, X=X_train_sc) - y_train) ** 2))
-
-    np.random.seed(SEED)
-    params_init = np.array([0.0, 0.1, 0.0, 0.1, 1.0, 0.0])
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        resultat = minimize(fun=objectif, x0=params_init, method="Nelder-Mead",
-                            options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-8})
-
-    previsions       = _lstar_prevision(params=resultat.x, X=X_test_sc)
-    serie_previsions = pd.Series(data=previsions, index=idx_test, name=f"STAR(p={n_lags_ar})")
-
-    if verbose:
-        print(f"  STAR(p={n_lags_ar}) : {len(serie_previsions)} previsions sur TEST, convergence={resultat.success}")
-
-    return serie_previsions
-
-
-# ==============================================================================
-# SECTION 11 : PIPELINE POUR UN FACTEUR (modeles en parallele)
+# SECTION 10 : PIPELINE POUR UN FACTEUR (modeles en parallele)
 # ==============================================================================
 
 # registre des taches : (nom_modele, fonction, kwargs)
@@ -785,7 +737,6 @@ _TACHES_NONLINEAIRES = [
     ("ARBF-PSO(k=5)",   prevoir_arbf_pso, {"n_centres": 5, "n_particules": 20, "n_iterations": 50}),
     ("GP(pop=500)",     prevoir_gp,       {"n_individus": 500, "n_generations": 10}),
     ("GEP(h=6)",        prevoir_gep,      {"taille_tete": 6, "n_genes": 3, "n_pop": 50, "n_gen": 20}),
-    ("STAR(p=1)",       prevoir_star,     {"n_lags_ar": 1}),
 ]
 
 
@@ -821,7 +772,7 @@ def generer_previsions_nonlineaires_facteur(serie: pd.Series, nom_facteur: str, 
 
 
 # ==============================================================================
-# SECTION 12 : PIPELINE COMPLET POUR LES 5 FACTEURS
+# SECTION 11 : PIPELINE COMPLET POUR LES 5 FACTEURS
 # ==============================================================================
 
 def executer_previsions_nonlineaires(verbose: bool = True) -> dict:
@@ -853,7 +804,7 @@ def executer_previsions_nonlineaires(verbose: bool = True) -> dict:
 
 
 # ==============================================================================
-# SECTION 13 : FONCTION DE CHARGEMENT
+# SECTION 12 : FONCTION DE CHARGEMENT
 # ==============================================================================
 
 def charger_previsions_nonlineaires(verbose: bool = True) -> dict:

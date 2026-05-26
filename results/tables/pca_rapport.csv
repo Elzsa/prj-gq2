@@ -1,0 +1,6 @@
+facteur,n_modeles_total,n_modeles_valides,n_composantes_pca,variance_expliquee,meilleur_modele,rmse_meilleur
+MKT,298,291,18,0.9538,HONN(ordre=2),0.044549
+SMB,298,298,20,0.9537,SMA(25),0.026319
+HML,298,295,15,0.9527,"ARMA(2,2)",0.024293
+RMW,298,297,18,0.9504,EMA(19),0.014248
+CMA,298,298,20,0.9519,"ARMA(2,2)",0.018507

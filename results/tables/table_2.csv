@@ -1,0 +1,6 @@
+Dataset,Start date,End date,Trading days
+Total dataset,1965-01-01,2017-08-01,631
+In-sample dataset,1965-01-01,1999-12-01,419
+Training dataset,1965-01-01,1983-12-01,227
+Test dataset,1984-01-01,1999-12-01,191
+Out-of-sample dataset,2000-01-01,2017-08-01,211

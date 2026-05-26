@@ -9,22 +9,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import warnings
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from statsmodels.tsa.arima.model import ARIMA
 
 from config.splits import TRAIN_START, TRAIN_END, TEST_START, TEST_END
 
-# noms des cinq facteurs Fama-French utilisés dans le papier
+# noms des cinq facteurs Fama-French utilises dans le papier
 FACTEURS = ["MKT", "SMB", "HML", "RMW", "CMA"]
 
 # chemin vers les log-rendements produits par preprocess.py
 CHEMIN_LOG_RETURNS = Path(__file__).resolve().parents[3] / "data" / "monthly_log_returns.csv"
 
-# chemin de sortie des prévisions individuelles linéaires
+# chemin de sortie des previsions individuelles lineaires
 CHEMIN_SORTIE = Path(__file__).resolve().parents[3] / "data" / "02_forecasting" / "individual_predictions_linear.csv"
+
+# nombre de jobs paralleles : -1 = tous les cores disponibles
+N_JOBS = -1
 
 
 # ==============================================================================
-# SECTION 1 : CHARGEMENT DES DONNÉES
+# SECTION 1 : CHARGEMENT DES DONNEES
 # ==============================================================================
 
 def charger_log_rendements(verbose: bool = True) -> pd.DataFrame:
@@ -44,34 +48,21 @@ def charger_log_rendements(verbose: bool = True) -> pd.DataFrame:
 
 
 # ==============================================================================
-# SECTION 2 : MODÈLES SMA (Simple Moving Average)
+# SECTION 2 : MODELES SMA (Simple Moving Average)
 # ==============================================================================
 # Papier Appendice A Table A.1 (page 20) :
 #   E(R_t) = (R_t-1 + ... + R_t-q) / q,  q = 3, ..., 30  ->  28 modeles
-
-def prevoir_sma(serie: pd.Series, q: int, periode_debut: str, periode_fin: str, verbose: bool = True) -> pd.Series:
-    """Calcule les previsions 1 pas en avant par moyenne mobile simple d'ordre q sur la periode [debut, fin]."""
-    # la prevision a t est la moyenne des q rendements passes : R_t-1, ..., R_t-q
-    # shift(1) decale d'une periode pour eviter le look-ahead bias
-    previsions = serie.shift(1).rolling(window=q).mean()
-
-    masque = (previsions.index >= periode_debut) & (previsions.index <= periode_fin)
-    previsions = previsions.loc[masque]
-
-    if verbose:
-        n_valides = previsions.notna().sum()
-        print(f"  SMA({q}) : {n_valides} previsions valides sur {len(previsions)} attendues")
-
-    return previsions
-
+# SMA et EMA sont vectorises : pas de parallelisme necessaire.
 
 def generer_previsions_sma(serie: pd.Series, periode_debut: str, periode_fin: str, verbose: bool = True) -> pd.DataFrame:
     """Genere les 28 previsions SMA (q de 3 a 30) pour une serie de rendements."""
     resultats = {}
 
     for q in range(3, 31):  # q = 3, 4, ..., 30  ->  28 modeles
-        nom_modele = f"SMA({q})"
-        resultats[nom_modele] = prevoir_sma(serie=serie, q=q, periode_debut=periode_debut, periode_fin=periode_fin, verbose=False)
+        # shift(1) : prevision pour t utilise R_t-1, ..., R_t-q (pas de look-ahead bias)
+        previsions = serie.shift(1).rolling(window=q).mean()
+        masque = (previsions.index >= periode_debut) & (previsions.index <= periode_fin)
+        resultats[f"SMA({q})"] = previsions.loc[masque]
 
     df_sma = pd.DataFrame(data=resultats)
 
@@ -82,40 +73,20 @@ def generer_previsions_sma(serie: pd.Series, periode_debut: str, periode_fin: st
 
 
 # ==============================================================================
-# SECTION 3 : MODÈLES EMA (Exponential Moving Average)
+# SECTION 3 : MODELES EMA (Exponential Moving Average)
 # ==============================================================================
 # Papier Appendice A Table A.1 (page 20) :
-#   E(R_t) = somme ponderee de R_t-1, ..., R_t-q' avec alpha' = 2/(1 + Ndays)
-#   Ndays est le nombre de jours de trading et q' = 3, ..., 30  ->  28 modeles
-# Le papier definit Ndays = q' car les donnees sont mensuelles.
-# alpha = 2 / (1 + q') est le facteur de lissage standard de l'EMA.
-
-def prevoir_ema(serie: pd.Series, q: int, periode_debut: str, periode_fin: str, verbose: bool = True) -> pd.Series:
-    """Calcule les previsions 1 pas en avant par moyenne mobile exponentielle d'ordre q sur la periode [debut, fin]."""
-    alpha = 2.0 / (1.0 + q)
-
-    # pandas ewm(span=q) utilise exactement alpha = 2/(1+span), ce qui correspond a la formule du papier
-    # adjust=False : implementation recursive R_t_ema = alpha * R_t + (1 - alpha) * R_t-1_ema
-    # shift(1) : la prevision pour t utilise les donnees jusqu'en t-1 (pas de look-ahead bias)
-    previsions = serie.shift(1).ewm(span=q, adjust=False).mean()
-
-    masque = (previsions.index >= periode_debut) & (previsions.index <= periode_fin)
-    previsions = previsions.loc[masque]
-
-    if verbose:
-        n_valides = previsions.notna().sum()
-        print(f"  EMA({q}) alpha={alpha:.4f} : {n_valides} previsions valides sur {len(previsions)} attendues")
-
-    return previsions
-
+#   E(R_t) = somme ponderee avec alpha' = 2/(1 + Ndays), q' = 3, ..., 30  ->  28 modeles
 
 def generer_previsions_ema(serie: pd.Series, periode_debut: str, periode_fin: str, verbose: bool = True) -> pd.DataFrame:
     """Genere les 28 previsions EMA (q de 3 a 30) pour une serie de rendements."""
     resultats = {}
 
     for q in range(3, 31):  # q = 3, 4, ..., 30  ->  28 modeles
-        nom_modele = f"EMA({q})"
-        resultats[nom_modele] = prevoir_ema(serie=serie, q=q, periode_debut=periode_debut, periode_fin=periode_fin, verbose=False)
+        # ewm(span=q) : alpha = 2/(1+q), adjust=False : recursif, shift(1) : pas de look-ahead bias
+        previsions = serie.shift(1).ewm(span=q, adjust=False).mean()
+        masque = (previsions.index >= periode_debut) & (previsions.index <= periode_fin)
+        resultats[f"EMA({q})"] = previsions.loc[masque]
 
     df_ema = pd.DataFrame(data=resultats)
 
@@ -126,63 +97,49 @@ def generer_previsions_ema(serie: pd.Series, periode_debut: str, periode_fin: st
 
 
 # ==============================================================================
-# SECTION 4 : MODÈLES AR (AutoRegressive)
+# SECTION 4 : MODELES AR (AutoRegressive)
 # ==============================================================================
 # Papier Appendice A Table A.1 (page 20) :
 #   E(R_t) = beta_0 + somme_i beta_i * R_t-i,  q = 1, ..., 24  ->  24 modeles
 #
-# Strategie d'estimation retenue : parametres estimes sur TRAIN (1965-1983),
-# previsions 1-step rolling sur TEST (1984-1999) via apply(refit=False).
-# Cela signifie que les coefficients du modele sont fixes et que seuls les
-# lags observes (vraies valeurs passees) sont mis a jour a chaque pas.
+# Strategie : params estimes sur TRAIN, apply(refit=False) sur TRAIN+TEST.
+# fittedvalues[t] = E[y_t | y_1,...,y_{t-1}, theta_fixe] -> vrais 1-step ahead forecasts.
+# Gain vs expanding window : ~200x (0.2s vs 43s par modele).
 #
-# Alternative ecartee : expanding window (re-estimation a chaque date t).
-# Raison : le papier ne mentionne pas explicitement l'expanding window pour
-# les modeles individuels (uniquement pour le DMA, Section 3.2.3).
-# De plus, l'expanding window multiplie le temps de calcul par 191
-# sans gain methodologique justifie par le texte.
-# Gain de performance : ~200x (0.2s vs 43s par modele).
+# Parallelisme niveau 1 : les 24 ordres AR sont independants -> Parallel sur q.
 
-def prevoir_ar(serie: pd.Series, q: int, serie_train: pd.Series, periode_pred_debut: str, periode_pred_fin: str, verbose: bool = True) -> pd.Series:
-    """Prevoit 1 pas en avant par AR(q) : params estimes sur serie_train, rolling 1-step sur periode de prediction."""
+def _prevoir_ar_un_ordre(q: int, serie: pd.Series, serie_train: pd.Series, periode_pred_debut: str, periode_pred_fin: str) -> tuple:
+    """Estime AR(q) sur serie_train et produit les previsions 1-step via apply(refit=False). Retourne (nom, serie)."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-
-        # estimation des parametres sur TRAIN uniquement
-        modele = ARIMA(endog=serie_train, order=(q, 0, 0), trend="c")
-        resultat_train = modele.fit(method="innovations_mle", low_memory=True)
-
-        # apply(refit=False) : rejoue le filtre sur la serie complete avec les params fixes
-        # fittedvalues[t] = E[y_t | y_1,...,y_{t-1}, theta_fixe] -> vrais 1-step ahead forecasts
-        resultat_full = resultat_train.apply(endog=serie, refit=False)
-        previsions = resultat_full.fittedvalues.loc[periode_pred_debut:periode_pred_fin]
+        modele         = ARIMA(endog=serie_train, order=(q, 0, 0), trend="c")
+        res_train      = modele.fit(method="innovations_mle", low_memory=True)
+        res_full       = res_train.apply(endog=serie, refit=False)
+        previsions     = res_full.fittedvalues.loc[periode_pred_debut:periode_pred_fin]
 
     previsions.name = f"AR({q})"
-
-    if verbose:
-        n_valides = previsions.notna().sum()
-        print(f"  AR({q}) : {n_valides}/{len(previsions)} previsions valides")
-
-    return previsions
+    return (f"AR({q})", previsions)
 
 
 def generer_previsions_ar(serie: pd.Series, serie_train: pd.Series, periode_pred_debut: str, periode_pred_fin: str, verbose: bool = True) -> pd.DataFrame:
-    """Genere les 24 previsions AR (q de 1 a 24) pour une serie de rendements."""
-    resultats = {}
+    """Genere les 24 previsions AR en parallele (q de 1 a 24) pour une serie de rendements."""
+    if verbose:
+        print(f"  AR : 24 estimations en parallele (N_JOBS={N_JOBS})...")
 
-    for q in range(1, 25):  # q = 1, 2, ..., 24  ->  24 modeles
-        if verbose:
-            print(f"  Estimation AR({q})...")
-        resultats[f"AR({q})"] = prevoir_ar(
-            serie=serie,
+    resultats_liste = Parallel(n_jobs=N_JOBS, prefer="threads")(
+        delayed(_prevoir_ar_un_ordre)(
             q=q,
+            serie=serie,
             serie_train=serie_train,
             periode_pred_debut=periode_pred_debut,
-            periode_pred_fin=periode_pred_fin,
-            verbose=False
+            periode_pred_fin=periode_pred_fin
         )
+        for q in range(1, 25)  # q = 1, ..., 24
+    )
 
-    df_ar = pd.DataFrame(data=resultats)
+    # reconstruction dans l'ordre AR(1), AR(2), ...
+    resultats = dict(resultats_liste)
+    df_ar = pd.DataFrame(data={f"AR({q})": resultats[f"AR({q})"] for q in range(1, 25)})
 
     if verbose:
         print(f"AR : {df_ar.shape[1]} modeles, {df_ar.shape[0]} observations sur {periode_pred_debut} - {periode_pred_fin}")
@@ -191,64 +148,55 @@ def generer_previsions_ar(serie: pd.Series, serie_train: pd.Series, periode_pred
 
 
 # ==============================================================================
-# SECTION 5 : MODÈLES ARMA (AutoRegressive Moving Average)
+# SECTION 5 : MODELES ARMA (AutoRegressive Moving Average)
 # ==============================================================================
 # Papier Appendice A Table A.1 (page 20) :
 #   E(R_t) = phi_0 + somme_j phi_j * R_t-j + a_0 + somme_k w_k * a_t-k
-#   m_prime, n_prime = 1, ..., 15 croises  ->  210 modeles
+#   m_prime dans [1,15], n_prime dans [1,14]  ->  15 x 14 = 210 modeles
 #
-# Decompte : le papier annonce 210 modeles ARMA.
-# 15 x 15 = 225, donc 15 combinaisons sont exclues.
-# La seule facon d'obtenir 210 est m' dans [1,15] et n' dans [1,14] : 15 x 14 = 210.
-# Ambiguite du papier : il n'est pas precise quelles combinaisons sont exclues.
-# Decision retenue : n_prime va de 1 a 14 (hypothese la plus parcimonieuse).
+# Ambiguite du papier : 15x15=225 mais le papier annonce 210.
+# Decision retenue : n_prime dans [1,14] (seule decomposition entiere donnant 210).
 #
-# Meme strategie que AR : params estimes sur TRAIN, apply(refit=False) sur TEST.
+# Parallelisme niveau 1 : les 210 combinaisons (p,q) sont independantes -> Parallel.
 
-def prevoir_arma(serie: pd.Series, p: int, q: int, serie_train: pd.Series, periode_pred_debut: str, periode_pred_fin: str, verbose: bool = True) -> pd.Series:
-    """Prevoit 1 pas en avant par ARMA(p,q) : params estimes sur serie_train, rolling 1-step sur periode de prediction."""
+def _prevoir_arma_un_ordre(p: int, q: int, serie: pd.Series, serie_train: pd.Series, periode_pred_debut: str, periode_pred_fin: str) -> tuple:
+    """Estime ARMA(p,q) sur serie_train et produit les previsions 1-step via apply(refit=False). Retourne (nom, serie)."""
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            modele = ARIMA(endog=serie_train, order=(p, 0, q), trend="c")
-            resultat_train = modele.fit(method="innovations_mle", low_memory=True)
-            resultat_full = resultat_train.apply(endog=serie, refit=False)
-            previsions = resultat_full.fittedvalues.loc[periode_pred_debut:periode_pred_fin]
+            modele     = ARIMA(endog=serie_train, order=(p, 0, q), trend="c")
+            res_train  = modele.fit(method="innovations_mle", low_memory=True)
+            res_full   = res_train.apply(endog=serie, refit=False)
+            previsions = res_full.fittedvalues.loc[periode_pred_debut:periode_pred_fin]
     except Exception:
-        # en cas d'echec de convergence : NaN sur toute la periode
         index_pred = serie.loc[periode_pred_debut:periode_pred_fin].index
         previsions = pd.Series(data=np.nan, index=index_pred)
 
     previsions.name = f"ARMA({p},{q})"
-
-    if verbose:
-        n_valides = previsions.notna().sum()
-        print(f"  ARMA({p},{q}) : {n_valides}/{len(previsions)} previsions valides")
-
-    return previsions
+    return (f"ARMA({p},{q})", previsions)
 
 
 def generer_previsions_arma(serie: pd.Series, serie_train: pd.Series, periode_pred_debut: str, periode_pred_fin: str, verbose: bool = True) -> pd.DataFrame:
-    """Genere les 210 previsions ARMA (m' de 1 a 15, n' de 1 a 14) pour une serie de rendements."""
-    # m' dans [1,15] x n' dans [1,14] = 15 x 14 = 210 modeles
-    resultats = {}
+    """Genere les 210 previsions ARMA en parallele (m' de 1 a 15, n' de 1 a 14)."""
+    combinaisons = [(p, q) for p in range(1, 16) for q in range(1, 15)]  # 15 x 14 = 210
 
-    for p in range(1, 16):      # m' = 1, ..., 15
-        for q in range(1, 15):  # n' = 1, ..., 14
-            nom_modele = f"ARMA({p},{q})"
-            if verbose:
-                print(f"  Estimation {nom_modele}...")
-            resultats[nom_modele] = prevoir_arma(
-                serie=serie,
-                p=p,
-                q=q,
-                serie_train=serie_train,
-                periode_pred_debut=periode_pred_debut,
-                periode_pred_fin=periode_pred_fin,
-                verbose=False
-            )
+    if verbose:
+        print(f"  ARMA : {len(combinaisons)} estimations en parallele (N_JOBS={N_JOBS})...")
 
-    df_arma = pd.DataFrame(data=resultats)
+    resultats_liste = Parallel(n_jobs=N_JOBS, prefer="threads")(
+        delayed(_prevoir_arma_un_ordre)(
+            p=p,
+            q=q,
+            serie=serie,
+            serie_train=serie_train,
+            periode_pred_debut=periode_pred_debut,
+            periode_pred_fin=periode_pred_fin
+        )
+        for p, q in combinaisons
+    )
+
+    resultats = dict(resultats_liste)
+    df_arma = pd.DataFrame(data={f"ARMA({p},{q})": resultats[f"ARMA({p},{q})"] for p, q in combinaisons})
 
     if verbose:
         print(f"ARMA : {df_arma.shape[1]} modeles, {df_arma.shape[0]} observations sur {periode_pred_debut} - {periode_pred_fin}")
@@ -257,7 +205,7 @@ def generer_previsions_arma(serie: pd.Series, serie_train: pd.Series, periode_pr
 
 
 # ==============================================================================
-# SECTION 6 : PIPELINE COMPLET POUR UN FACTEUR
+# SECTION 6 : PIPELINE POUR UN FACTEUR
 # ==============================================================================
 
 def generer_previsions_lineaires_facteur(serie: pd.Series, nom_facteur: str, verbose: bool = True) -> pd.DataFrame:
@@ -267,88 +215,69 @@ def generer_previsions_lineaires_facteur(serie: pd.Series, nom_facteur: str, ver
         print(f"Facteur : {nom_facteur}")
         print(f"{'='*60}")
 
-    # serie d'estimation : TRAIN uniquement (1965-1983)
-    serie_train = serie.loc[TRAIN_START:TRAIN_END]
+    serie_train    = serie.loc[TRAIN_START:TRAIN_END]   # 1965-1983 : estimation des params
+    serie_insample = serie.loc[TRAIN_START:TEST_END]    # 1965-1999 : apply() et SMA/EMA
 
-    # serie complete in-sample pour SMA/EMA et pour apply() des AR/ARMA
-    serie_insample = serie.loc[TRAIN_START:TEST_END]
-
-    # --- SMA : 28 modeles ---
     if verbose:
         print("\nSMA (28 modeles)...")
-    df_sma = generer_previsions_sma(
-        serie=serie_insample,
-        periode_debut=TEST_START,
-        periode_fin=TEST_END,
-        verbose=verbose
-    )
+    df_sma = generer_previsions_sma(serie=serie_insample, periode_debut=TEST_START, periode_fin=TEST_END, verbose=verbose)
 
-    # --- EMA : 28 modeles ---
     if verbose:
         print("\nEMA (28 modeles)...")
-    df_ema = generer_previsions_ema(
-        serie=serie_insample,
-        periode_debut=TEST_START,
-        periode_fin=TEST_END,
-        verbose=verbose
-    )
+    df_ema = generer_previsions_ema(serie=serie_insample, periode_debut=TEST_START, periode_fin=TEST_END, verbose=verbose)
 
-    # --- AR : 24 modeles ---
     if verbose:
         print("\nAR (24 modeles)...")
-    df_ar = generer_previsions_ar(
-        serie=serie_insample,
-        serie_train=serie_train,
-        periode_pred_debut=TEST_START,
-        periode_pred_fin=TEST_END,
-        verbose=verbose
-    )
+    df_ar = generer_previsions_ar(serie=serie_insample, serie_train=serie_train, periode_pred_debut=TEST_START, periode_pred_fin=TEST_END, verbose=verbose)
 
-    # --- ARMA : 210 modeles ---
     if verbose:
         print("\nARMA (210 modeles)...")
-    df_arma = generer_previsions_arma(
-        serie=serie_insample,
-        serie_train=serie_train,
-        periode_pred_debut=TEST_START,
-        periode_pred_fin=TEST_END,
-        verbose=verbose
-    )
+    df_arma = generer_previsions_arma(serie=serie_insample, serie_train=serie_train, periode_pred_debut=TEST_START, periode_pred_fin=TEST_END, verbose=verbose)
 
-    # concatenation horizontale des 4 familles : 28 + 28 + 24 + 210 = 290 colonnes
+    # concatenation : 28 + 28 + 24 + 210 = 290 colonnes
     df_complet = pd.concat(objs=[df_sma, df_ema, df_ar, df_arma], axis=1)
 
     assert df_complet.shape[1] == 290, f"Attendu 290 modeles, obtenu {df_complet.shape[1]}"
 
     if verbose:
-        n_nans = df_complet.isna().sum().sum()
+        n_nans  = df_complet.isna().sum().sum()
         n_total = df_complet.shape[1] * df_complet.shape[0]
         print(f"\nTotal : {df_complet.shape[1]} modeles, {df_complet.shape[0]} observations")
-        print(f"Valeurs manquantes (NaN) : {n_nans} sur {n_total} ({100*n_nans/n_total:.1f}%)")
+        print(f"Valeurs manquantes : {n_nans} sur {n_total} ({100*n_nans/n_total:.1f}%)")
 
     return df_complet
 
 
 # ==============================================================================
-# SECTION 7 : PIPELINE COMPLET POUR LES 5 FACTEURS
+# SECTION 7 : PIPELINE COMPLET POUR LES 5 FACTEURS (parallelisme niveau 2)
 # ==============================================================================
 
+def _generer_facteur_wrapper(facteur: str, df_log: pd.DataFrame, verbose: bool) -> tuple:
+    """Wrapper pour generer_previsions_lineaires_facteur en parallele. Retourne (facteur, DataFrame)."""
+    return (facteur, generer_previsions_lineaires_facteur(serie=df_log[facteur], nom_facteur=facteur, verbose=verbose))
+
+
 def executer_previsions_lineaires(verbose: bool = True) -> dict:
-    """Execute les 290 previsions lineaires pour les 5 facteurs et sauvegarde en CSV multi-index."""
+    """Execute les 290 previsions lineaires pour les 5 facteurs en parallele et sauvegarde en CSV multi-index."""
     print("ETAPE 02_FORECASTING INDIVIDUAL LINEAR ===================") if verbose else None
 
     df_log = charger_log_rendements(verbose=verbose)
 
-    previsions_par_facteur = {}
+    if verbose:
+        print(f"\nParallelisme niveau 2 : 5 facteurs en parallele (N_JOBS={N_JOBS})...")
 
-    for facteur in FACTEURS:
-        serie_facteur = df_log[facteur]
-        df_previsions = generer_previsions_lineaires_facteur(
-            serie=serie_facteur,
-            nom_facteur=facteur,
+    # parallelisme niveau 2 : les 5 facteurs sont independants
+    # prefer="processes" : taches longues et CPU-bound (ARIMA), le fork est amorti
+    resultats_liste = Parallel(n_jobs=N_JOBS, prefer="processes")(
+        delayed(_generer_facteur_wrapper)(
+            facteur=facteur,
+            df_log=df_log,
             verbose=verbose
         )
-        previsions_par_facteur[facteur] = df_previsions
+        for facteur in FACTEURS
+    )
+
+    previsions_par_facteur = dict(resultats_liste)
 
     # sauvegarde CSV avec multi-index (facteur, modele) en colonnes
     df_global = pd.concat(objs=previsions_par_facteur, axis=1)
@@ -366,7 +295,7 @@ def executer_previsions_lineaires(verbose: bool = True) -> dict:
 
 
 # ==============================================================================
-# SECTION 8 : FONCTIONS UTILITAIRES DE CHARGEMENT
+# SECTION 8 : CHARGEMENT
 # ==============================================================================
 
 def charger_previsions_lineaires(verbose: bool = True) -> dict:
@@ -376,7 +305,7 @@ def charger_previsions_lineaires(verbose: bool = True) -> dict:
         index_col=0,
         parse_dates=True,
         date_format="%Y-%m-%d",
-        header=[0, 1]  # multi-index de colonnes : (facteur, modele)
+        header=[0, 1]
     )
 
     previsions_par_facteur = {}
@@ -391,4 +320,4 @@ def charger_previsions_lineaires(verbose: bool = True) -> dict:
 
 if __name__ == "__main__":
     previsions = executer_previsions_lineaires(verbose=True)
-    a = True # 23h30
+    a = True # début 13h02
