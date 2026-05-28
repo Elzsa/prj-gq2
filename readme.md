@@ -4,7 +4,7 @@ Papier : « Revisiting Fama–French factors' predictability with Bayesian model
 Auteurs : Yang Zhao | Charalampos Stasinakis | Georgios Sermpinis | Filipa Da Silva Fernandes
 
 Langage de programmation : Python  
-Étudiants : Arthur LE NET | Loélia MEYER | Charlène JULIEN | Elsa PAYA
+Étudiants : Arthur LE NET  | Loélia MEYER | Charlène JULIEN | Elsa PAYA
 
 ## Installation du projet (Windows et/ou MAC)
 
@@ -121,5 +121,4 @@ PRJ-GQ2/
 └── results/
     ├── tables/                                        # Tables 1-10 reproduites
     └── figures/                                       # Figure 1 (cumulative returns)
-
 ```
