@@ -6,6 +6,7 @@ from pathlib import Path
 # ajout de la racine du projet au sys.path pour permettre les imports absolus
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import pickle
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
@@ -34,6 +35,9 @@ CHEMIN_SORTIE_RAPPORT   = Path(__file__).resolve().parents[2] / "results" / "tab
 
 # chemin de sortie de la Table 3 (reproduction du papier, Section 3.1)
 CHEMIN_TABLE_3 = Path(__file__).resolve().parents[2] / "results" / "tables" / "table_3.csv"
+
+# chemin de sauvegarde des objets PCA (scaler + pca) pour projection OOS dans svr.py
+CHEMIN_PCA_OBJETS = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "pca_objets.pkl"
 
 # metriques d'evaluation pour selectionner le meilleur modele individuel
 # le papier utilise MAE, RMSE, MAPE, Theil-U (Table 4)
@@ -71,7 +75,7 @@ def charger_previsions_individuelles(verbose: bool = True) -> dict:
         df_lin    = df_linear[facteur]
         df_nonlin = df_nonlinear[facteur]
 
-        # concatenation horizontale : 290 colonnes lineaires + 9 colonnes non lineaires = 299
+        # concatenation horizontale : 290 colonnes lineaires + 10 colonnes non lineaires = 300
         # le papier annonce 328, l'ecart vient des variantes non implementees (nonlinear.py)
         df_complet = pd.concat(objs=[df_lin, df_nonlin], axis=1)
 
@@ -253,6 +257,25 @@ def executer_pca_selection(df_log: pd.DataFrame, verbose: bool = True) -> dict:
     df_composantes_global.columns.names = ["facteur", "composante"]
     CHEMIN_SORTIE_PCA.parent.mkdir(parents=True, exist_ok=True)
     df_composantes_global.to_csv(path_or_buf=CHEMIN_SORTIE_PCA, date_format="%Y-%m-%d")
+
+    # sauvegarde des objets PCA pour projection OOS : {facteur: (scaler, pca, cols_valides)}
+    objets_pca = {f: (StandardScaler(), pca_objects[f], cols_valides_par_facteur[f]) for f in FACTEURS}
+    # re-fitter les scalers sur les memes donnees que lors de l'ACP
+    previsions_par_facteur_reload = charger_previsions_individuelles(verbose=False)
+    for facteur in FACTEURS:
+        df_prev    = previsions_par_facteur_reload[facteur]
+        cols       = cols_valides_par_facteur[facteur]
+        df_filtre  = df_prev[cols].copy()
+        for col in df_filtre.columns:
+            df_filtre[col] = df_filtre[col].fillna(value=df_filtre[col].mean())
+        scaler_refitte = StandardScaler()
+        scaler_refitte.fit(df_filtre.values)
+        objets_pca[facteur] = (scaler_refitte, pca_objects[facteur], cols)
+    CHEMIN_PCA_OBJETS.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHEMIN_PCA_OBJETS, 'wb') as f:
+        pickle.dump(objets_pca, f)
+    if verbose:
+        print(f"Objets PCA sauvegardes : {CHEMIN_PCA_OBJETS}")
 
     # --- sauvegarde du meilleur modele individuel par facteur ---
     df_meilleur = pd.DataFrame(data=meilleur_par_facteur)

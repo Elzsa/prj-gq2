@@ -6,11 +6,13 @@ from pathlib import Path
 # ajout de la racine du projet au sys.path pour permettre les imports absolus
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import pickle
 import numpy as np
 import pandas as pd
 from itertools import product
 from sklearn.svm import NuSVR
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_score
 
 from config.splits import TEST_START, TEST_END, OOS_START, OOS_END
 
@@ -18,9 +20,12 @@ from config.splits import TEST_START, TEST_END, OOS_START, OOS_END
 FACTEURS = ["MKT", "SMB", "HML", "RMW", "CMA"]
 
 # chemins des inputs et outputs
-CHEMIN_PCA        = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "pca_components_v2.csv"
-CHEMIN_LOG_RETURNS = Path(__file__).resolve().parents[2] / "data" / "monthly_log_returns.csv"
-CHEMIN_SORTIE     = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "previsions_svr.csv"
+CHEMIN_PCA             = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "pca_components.csv"
+CHEMIN_PCA_OBJETS      = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "pca_objets.pkl"
+CHEMIN_LINEAR_OOS      = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "individual_predictions_linear_oos.csv"
+CHEMIN_NONLINEAR_OOS   = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "individual_predictions_nonlinear_oos.csv"
+CHEMIN_LOG_RETURNS     = Path(__file__).resolve().parents[2] / "data" / "monthly_log_returns.csv"
+CHEMIN_SORTIE          = Path(__file__).resolve().parents[2] / "data" / "02_forecasting" / "previsions_svr.csv"
 
 # ==============================================================================
 # GRILLE DE RECHERCHE vSVR
@@ -30,8 +35,8 @@ CHEMIN_SORTIE     = Path(__file__).resolve().parents[2] / "data" / "02_forecasti
 # Grille standard pour series financieres mensuelles.
 # Ambiguite du papier : la grille exacte n'est pas precisee.
 # Decision retenue : grille log-uniforme classique.
-GRILLE_C  = [0.01, 0.1, 1.0, 10.0, 100.0]
-GRILLE_NU = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+GRILLE_C  = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+GRILLE_NU = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
 
 
 # ==============================================================================
@@ -39,7 +44,7 @@ GRILLE_NU = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 # ==============================================================================
 
 def charger_composantes_pca(verbose: bool = True) -> dict:
-    """Charge les composantes PCA par facteur depuis le CSV multi-index."""
+    """Charge les composantes PCA in-sample (TRAIN+TEST) par facteur depuis le CSV multi-index."""
     df_global = pd.read_csv(
         filepath_or_buffer=CHEMIN_PCA,
         index_col=0,
@@ -54,9 +59,66 @@ def charger_composantes_pca(verbose: bool = True) -> dict:
 
     if verbose:
         exemple = composantes_par_facteur[FACTEURS[0]]
-        print(f"Composantes PCA chargees : {exemple.shape[0]} dates, {exemple.shape[1]} composantes pour {FACTEURS[0]}")
+        print(f"Composantes PCA in-sample chargees : {exemple.shape[0]} dates, {exemple.shape[1]} composantes pour {FACTEURS[0]}")
 
     return composantes_par_facteur
+
+
+def charger_objets_pca(verbose: bool = True) -> dict:
+    """Charge les objets PCA (scaler, pca, cols_valides) sauvegardes par pca_selection.py."""
+    with open(CHEMIN_PCA_OBJETS, "rb") as f:
+        objets_pca = pickle.load(f)
+
+    if verbose:
+        print(f"Objets PCA charges pour {list(objets_pca.keys())}")
+
+    return objets_pca
+
+
+def projeter_previsions_oos(facteur: str, objets_pca: dict, verbose: bool = True) -> pd.DataFrame:
+    """Charge les previsions individuelles OOS et les projette sur les axes PCA in-sample."""
+    # chargement des CSV OOS produits par linear.py et non_linear.py
+    df_linear_oos = pd.read_csv(
+        filepath_or_buffer=CHEMIN_LINEAR_OOS,
+        index_col=0, parse_dates=True, date_format="%Y-%m-%d", header=[0, 1]
+    )
+    df_nonlinear_oos = pd.read_csv(
+        filepath_or_buffer=CHEMIN_NONLINEAR_OOS,
+        index_col=0, parse_dates=True, date_format="%Y-%m-%d", header=[0, 1]
+    )
+
+    df_oos = pd.concat([df_linear_oos[facteur], df_nonlinear_oos[facteur]], axis=1)
+
+    if len(df_oos) == 0:
+        if verbose:
+            print(f"  Aucune prevision OOS disponible pour {facteur}")
+        return pd.DataFrame()
+
+    # recuperation du scaler et pca ajustes sur TRAIN+TEST
+    scaler, pca, cols_valides = objets_pca[facteur]
+
+    # ne garder que les colonnes utilisees lors de la PCA in-sample
+    
+    df_oos_filtre = df_oos.reindex(columns=cols_valides, fill_value=0.0)
+
+    # imputation des NaN par la moyenne de la colonne
+    for col in df_oos_filtre.columns:
+        df_oos_filtre[col] = df_oos_filtre[col].fillna(value=df_oos_filtre[col].mean())
+
+    # projection sur les axes PCA in-sample
+    X_oos_sc  = scaler.transform(df_oos_filtre.values)
+    X_oos_pca = pca.transform(X_oos_sc)
+
+    df_composantes_oos = pd.DataFrame(
+        data=X_oos_pca,
+        index=df_oos_filtre.index,
+        columns=[f"PC{i+1}" for i in range(X_oos_pca.shape[1])]
+    )
+
+    if verbose:
+        print(f"  Projection OOS : {df_composantes_oos.shape[0]} dates, {df_composantes_oos.shape[1]} composantes")
+
+    return df_composantes_oos
 
 
 def charger_log_rendements(verbose: bool = True) -> pd.DataFrame:
@@ -147,18 +209,18 @@ def prevoir_vsvr_oos(X_test: np.ndarray, y_test: np.ndarray, X_oos: np.ndarray, 
 # SECTION 4 : PIPELINE COMPLET POUR UN FACTEUR
 # ==============================================================================
 
-def prevoir_svr_facteur(facteur: str, composantes: pd.DataFrame, df_log: pd.DataFrame, verbose: bool = True) -> pd.Series:
+def prevoir_svr_facteur(facteur: str, composantes_insample: pd.DataFrame, composantes_oos: pd.DataFrame, df_log: pd.DataFrame, verbose: bool = True) -> pd.Series:
     """Calibre le vSVR sur TEST et produit les previsions OOS pour un facteur. Retourne une Serie."""
     if verbose:
         print(f"\n  Facteur : {facteur}")
 
-    # separation TEST / OOS sur les composantes PCA
-    masque_test = (composantes.index >= TEST_START) & (composantes.index <= TEST_END)
-    masque_oos  = (composantes.index >= OOS_START)  & (composantes.index <= OOS_END)
+    # X_test : composantes PCA sur la periode TEST uniquement (depuis in-sample)
+    masque_test = (composantes_insample.index >= TEST_START) & (composantes_insample.index <= TEST_END)
+    X_test  = composantes_insample.loc[masque_test].values
 
-    X_test = composantes.loc[masque_test].values
-    X_oos  = composantes.loc[masque_oos].values
-    idx_oos = composantes.loc[masque_oos].index
+    # X_oos : composantes PCA projetees sur OOS (depuis projeter_previsions_oos)
+    X_oos   = composantes_oos.values
+    idx_oos = composantes_oos.index
 
     # vraies valeurs TEST : masque construit sur l'index de df_log (631 obs)
     masque_test_log = (df_log.index >= TEST_START) & (df_log.index <= TEST_END)
@@ -196,15 +258,20 @@ def executer_previsions_svr(verbose: bool = True) -> pd.DataFrame:
     print("ETAPE 02_FORECASTING SVR =================================") if verbose else None
 
     composantes_par_facteur = charger_composantes_pca(verbose=verbose)
+    objets_pca              = charger_objets_pca(verbose=verbose)
     df_log                  = charger_log_rendements(verbose=verbose)
 
     previsions_par_facteur = {}
 
     for facteur in FACTEURS:
-        composantes = composantes_par_facteur[facteur]
-        serie_prev  = prevoir_svr_facteur(
+        # projection des previsions individuelles OOS sur les axes PCA in-sample
+        composantes_oos = projeter_previsions_oos(
+            facteur=facteur, objets_pca=objets_pca, verbose=verbose
+        )
+        serie_prev = prevoir_svr_facteur(
             facteur=facteur,
-            composantes=composantes,
+            composantes_insample=composantes_par_facteur[facteur],
+            composantes_oos=composantes_oos,
             df_log=df_log,
             verbose=verbose
         )

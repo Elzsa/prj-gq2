@@ -17,7 +17,7 @@ from scipy.optimize import minimize
 import torch
 import torch.nn as nn
 
-from config.splits import TRAIN_START, TRAIN_END, TEST_START, TEST_END
+from config.splits import TRAIN_START, TRAIN_END, TEST_START, TEST_END, OOS_START, OOS_END
 
 # noms des cinq facteurs Fama-French
 FACTEURS = ["MKT", "SMB", "HML", "RMW", "CMA"]
@@ -25,8 +25,11 @@ FACTEURS = ["MKT", "SMB", "HML", "RMW", "CMA"]
 # chemin vers les log-rendements produits par preprocess.py
 CHEMIN_LOG_RETURNS = Path(__file__).resolve().parents[3] / "data" / "monthly_log_returns.csv"
 
-# chemin de sortie des previsions individuelles non lineaires
+# chemin de sortie des previsions individuelles non lineaires (in-sample)
 CHEMIN_SORTIE = Path(__file__).resolve().parents[3] / "data" / "02_forecasting" / "individual_predictions_nonlinear.csv"
+
+# chemin de sortie des previsions individuelles non lineaires (OOS)
+CHEMIN_SORTIE_OOS = Path(__file__).resolve().parents[3] / "data" / "02_forecasting" / "individual_predictions_nonlinear_oos.csv"
 
 # nombre de lags utilises comme inputs pour tous les modeles non lineaires
 # decision retenue : 6 lags, coherent avec AR(6) observe en Table 3 du papier Zhao 2019
@@ -1058,6 +1061,329 @@ def generer_previsions_nonlineaires_facteur(serie: pd.Series, nom_facteur: str, 
     return df_complet
 
 
+
+# ==============================================================================
+# SECTION 11B : PREVISIONS OOS POUR LES MODELES NON LINEAIRES
+# ==============================================================================
+# Pour produire les previsions OOS, on re-applique chaque modele estime sur TRAIN
+# directement sur les donnees OOS. Les parametres restent fixes sur TRAIN.
+# Pas de look-ahead bias : le scaler et le modele sont fites sur TRAIN uniquement.
+
+def preparer_oos(serie: pd.Series, n_lags: int = N_LAGS) -> tuple:
+    """Prepare X_oos et idx_oos depuis une serie de rendements."""
+    df = construire_matrice_lags(serie=serie, n_lags=n_lags)
+    cols_lags  = [f"lag_{i}" for i in range(1, n_lags + 1)]
+    masque_oos = (df.index >= OOS_START) & (df.index <= OOS_END)
+    X_oos      = df.loc[masque_oos, cols_lags].values
+    idx_oos    = df.loc[masque_oos].index
+    return X_oos, idx_oos
+
+
+def prevoir_knn_oos(serie: pd.Series, k: int = 5, verbose: bool = True) -> pd.Series:
+    """Prevoit par kNN sur OOS : estime sur TRAIN, predit sur OOS."""
+    X_train, y_train, _, _, _, _ = preparer_train_test(serie=serie)
+    X_oos, idx_oos = preparer_oos(serie=serie)
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_oos_sc   = scaler.transform(X_oos)
+    modele = KNeighborsRegressor(n_neighbors=k, metric="euclidean")
+    modele.fit(X=X_train_sc, y=y_train)
+    return pd.Series(data=modele.predict(X=X_oos_sc), index=idx_oos, name=f"kNN({k})")
+
+
+def prevoir_mlp_oos(serie: pd.Series, n_hidden: int = 5, verbose: bool = True) -> pd.Series:
+    """Prevoit par MLP sur OOS : estime sur TRAIN avec early stopping sur TEST, predit sur OOS."""
+    X_train, y_train, X_test, y_test, _, _ = preparer_train_test(serie=serie)
+    X_oos, idx_oos = preparer_oos(serie=serie)
+    scaler_x = StandardScaler(); scaler_y = StandardScaler()
+    X_train_sc = scaler_x.fit_transform(X_train)
+    y_train_sc = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+    X_test_sc  = scaler_x.transform(X_test)
+    y_test_sc  = scaler_y.transform(y_test.reshape(-1, 1)).ravel()
+    X_oos_sc   = scaler_x.transform(X_oos)
+    torch.manual_seed(SEED)
+    modele = _MLP(n_inputs=X_train.shape[1], n_hidden=n_hidden)
+    modele = _entrainer_nn_early_stopping(
+        modele=modele,
+        X_train_t=torch.tensor(X_train_sc, dtype=torch.float32),
+        y_train_t=torch.tensor(y_train_sc, dtype=torch.float32),
+        X_test_t=torch.tensor(X_test_sc,  dtype=torch.float32),
+        y_test_t=torch.tensor(y_test_sc,  dtype=torch.float32),
+        epochs_max=EPOCHS_MAX, patience=EPOCHS_PATIENCE
+    )
+    modele.eval()
+    with torch.no_grad():
+        prev_sc = modele(torch.tensor(X_oos_sc, dtype=torch.float32)).squeeze().numpy()
+    return pd.Series(data=scaler_y.inverse_transform(prev_sc.reshape(-1,1)).ravel(), index=idx_oos, name=f"MLP(h={n_hidden})")
+
+
+def prevoir_rnn_oos(serie: pd.Series, n_hidden: int = 5, verbose: bool = True) -> pd.Series:
+    """Prevoit par RNN Elman sur OOS."""
+    X_train, y_train, X_test, y_test, _, _ = preparer_train_test(serie=serie)
+    X_oos, idx_oos = preparer_oos(serie=serie)
+    scaler_x = StandardScaler(); scaler_y = StandardScaler()
+    X_train_sc = scaler_x.fit_transform(X_train)
+    y_train_sc = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+    X_oos_sc   = scaler_x.transform(X_oos)
+    X_test_sc  = scaler_x.transform(X_test)
+    y_test_sc  = scaler_y.transform(y_test.reshape(-1, 1)).ravel()
+    torch.manual_seed(SEED)
+    modele = _ElmanRNN(n_inputs=X_train.shape[1], n_hidden=n_hidden)
+    modele = _entrainer_nn_early_stopping(
+        modele=modele,
+        X_train_t=torch.tensor(X_train_sc, dtype=torch.float32),
+        y_train_t=torch.tensor(y_train_sc, dtype=torch.float32),
+        X_test_t=torch.tensor(X_test_sc,  dtype=torch.float32),
+        y_test_t=torch.tensor(y_test_sc,  dtype=torch.float32),
+        epochs_max=EPOCHS_MAX, patience=EPOCHS_PATIENCE
+    )
+    modele.eval()
+    with torch.no_grad():
+        prev_sc = modele(torch.tensor(X_oos_sc, dtype=torch.float32)).squeeze().numpy()
+    return pd.Series(data=scaler_y.inverse_transform(prev_sc.reshape(-1,1)).ravel(), index=idx_oos, name=f"RNN(h={n_hidden})")
+
+
+def prevoir_honn_oos(serie: pd.Series, n_hidden: int = 5, ordre: int = 2, verbose: bool = True) -> pd.Series:
+    """Prevoit par HONN sur OOS."""
+    X_train, y_train, X_test, y_test, _, _ = preparer_train_test(serie=serie)
+    X_oos_base, idx_oos = preparer_oos(serie=serie)
+    X_train_ho = _construire_features_honn(X=X_train, ordre=ordre)
+    X_oos_ho   = _construire_features_honn(X=X_oos_base, ordre=ordre)
+    X_test_ho  = _construire_features_honn(X=X_test,  ordre=ordre)
+    scaler_x = StandardScaler(); scaler_y = StandardScaler()
+    X_train_sc = scaler_x.fit_transform(X_train_ho)
+    y_train_sc = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+    X_oos_sc   = scaler_x.transform(X_oos_ho)
+    X_test_sc  = scaler_x.transform(X_test_ho)
+    y_test_sc  = scaler_y.transform(y_test.reshape(-1, 1)).ravel()
+    torch.manual_seed(SEED)
+    modele = _HONN(n_inputs_augmentes=X_train_sc.shape[1], n_hidden=n_hidden)
+    modele = _entrainer_nn_early_stopping(
+        modele=modele,
+        X_train_t=torch.tensor(X_train_sc, dtype=torch.float32),
+        y_train_t=torch.tensor(y_train_sc, dtype=torch.float32),
+        X_test_t=torch.tensor(X_test_sc,  dtype=torch.float32),
+        y_test_t=torch.tensor(y_test_sc,  dtype=torch.float32),
+        epochs_max=EPOCHS_MAX, patience=EPOCHS_PATIENCE
+    )
+    modele.eval()
+    with torch.no_grad():
+        prev_sc = modele(torch.tensor(X_oos_sc, dtype=torch.float32)).squeeze().numpy()
+    return pd.Series(data=scaler_y.inverse_transform(prev_sc.reshape(-1,1)).ravel(), index=idx_oos, name=f"HONN(ordre={ordre})")
+
+
+def prevoir_psn_oos(serie: pd.Series, n_hidden: int = 5, verbose: bool = True) -> pd.Series:
+    """Prevoit par PSN sur OOS."""
+    X_train, y_train, X_test, y_test, _, _ = preparer_train_test(serie=serie)
+    X_oos, idx_oos = preparer_oos(serie=serie)
+    scaler_x = StandardScaler(); scaler_y = StandardScaler()
+    X_train_sc = scaler_x.fit_transform(X_train)
+    y_train_sc = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+    X_oos_sc   = scaler_x.transform(X_oos)
+    X_test_sc  = scaler_x.transform(X_test)
+    y_test_sc  = scaler_y.transform(y_test.reshape(-1, 1)).ravel()
+    torch.manual_seed(SEED)
+    modele = _PsiSigmaNetwork(n_inputs=X_train.shape[1], n_hidden=n_hidden)
+    modele = _entrainer_nn_early_stopping(
+        modele=modele,
+        X_train_t=torch.tensor(X_train_sc, dtype=torch.float32),
+        y_train_t=torch.tensor(y_train_sc, dtype=torch.float32),
+        X_test_t=torch.tensor(X_test_sc,  dtype=torch.float32),
+        y_test_t=torch.tensor(y_test_sc,  dtype=torch.float32),
+        epochs_max=EPOCHS_MAX, patience=EPOCHS_PATIENCE
+    )
+    modele.eval()
+    with torch.no_grad():
+        prev_sc = modele(torch.tensor(X_oos_sc, dtype=torch.float32)).squeeze().numpy()
+    return pd.Series(data=scaler_y.inverse_transform(prev_sc.reshape(-1,1)).ravel(), index=idx_oos, name=f"PSN(h={n_hidden})")
+
+
+def prevoir_arbf_pso_oos(serie: pd.Series, n_centres: int = 5, n_particules: int = 20, n_iterations: int = 50, verbose: bool = True) -> pd.Series:
+    """Prevoit par ARBF-PSO sur OOS."""
+    X_train, y_train, _, _, _, _ = preparer_train_test(serie=serie)
+    X_oos, idx_oos = preparer_oos(serie=serie)
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_oos_sc   = scaler.transform(X_oos)
+    n_inputs = X_train_sc.shape[1]
+    dim_pso  = n_centres * n_inputs + n_centres
+    np.random.seed(SEED)
+    positions = np.random.randn(n_particules, dim_pso) * 0.5
+    vitesses  = np.random.randn(n_particules, dim_pso) * 0.1
+    pbest_pos = positions.copy(); pbest_val = np.full(n_particules, np.inf)
+    gbest_pos = None; gbest_val = np.inf
+    w = 0.729; c1 = 1.494; c2 = 1.494
+    def evaluer(pos):
+        centres = pos[:n_centres*n_inputs].reshape(n_centres, n_inputs)
+        sigmas  = np.abs(pos[n_centres*n_inputs:]) + 0.01
+        phi     = _rbf_output(X=X_train_sc, centres=centres, sigmas=sigmas)
+        poids   = _estimer_poids_rbf(phi_train=phi, y_train=y_train)
+        return float(np.sqrt(mean_squared_error(y_true=y_train, y_pred=phi @ poids)))
+    for _ in range(n_iterations):
+        for i in range(n_particules):
+            val = evaluer(positions[i])
+            if val < pbest_val[i]: pbest_val[i] = val; pbest_pos[i] = positions[i].copy()
+            if val < gbest_val:    gbest_val = val;    gbest_pos = positions[i].copy()
+        r1 = np.random.rand(n_particules, dim_pso); r2 = np.random.rand(n_particules, dim_pso)
+        vitesses  = w*vitesses + c1*r1*(pbest_pos-positions) + c2*r2*(gbest_pos-positions)
+        positions = positions + vitesses
+    centres_opt = gbest_pos[:n_centres*n_inputs].reshape(n_centres, n_inputs)
+    sigmas_opt  = np.abs(gbest_pos[n_centres*n_inputs:]) + 0.01
+    phi_train   = _rbf_output(X=X_train_sc, centres=centres_opt, sigmas=sigmas_opt)
+    poids_opt   = _estimer_poids_rbf(phi_train=phi_train, y_train=y_train)
+    phi_oos     = _rbf_output(X=X_oos_sc,   centres=centres_opt, sigmas=sigmas_opt)
+    return pd.Series(data=phi_oos @ poids_opt, index=idx_oos, name=f"ARBF-PSO(k={n_centres})")
+
+
+def prevoir_gp_oos(serie: pd.Series, n_individus: int = 500, n_generations: int = 10, verbose: bool = True) -> pd.Series:
+    """Prevoit par GP sur OOS."""
+    X_train, y_train, _, _, _, _ = preparer_train_test(serie=serie)
+    X_oos, idx_oos = preparer_oos(serie=serie)
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train); X_oos_sc = scaler.transform(X_oos)
+    n_terminaux = X_train_sc.shape[1]; rng = np.random.default_rng(seed=SEED)
+    population = [_gp_arbre_aleatoire(n_terminaux=n_terminaux, profondeur=_GP_PROFONDEUR_MAX, rng=rng) for _ in range(n_individus)]
+    meilleur_arbre = None; meilleure_fitness = -np.inf
+    for _ in range(n_generations):
+        scores = [_gp_fitness(arbre=ind, X=X_train_sc, y=y_train) for ind in population]
+        idx_max = int(np.argmax(scores))
+        if scores[idx_max] > meilleure_fitness: meilleure_fitness = scores[idx_max]; meilleur_arbre = population[idx_max].copy()
+        nouvelle_pop = [meilleur_arbre]
+        while len(nouvelle_pop) < n_individus:
+            cand1 = rng.integers(0, n_individus, 3); p1 = population[cand1[int(np.argmax([scores[c] for c in cand1]))]].copy()
+            cand2 = rng.integers(0, n_individus, 3); p2 = population[cand2[int(np.argmax([scores[c] for c in cand2]))]].copy()
+            enfant = _gp_croiser(p1, p2, rng) if rng.random() < 0.9 else _gp_muter(p1, n_terminaux, rng)
+            nouvelle_pop.append(enfant)
+        population = nouvelle_pop
+    if meilleur_arbre is None: prev = np.zeros(len(idx_oos))
+    else:
+        prev, _ = _gp_evaluer(arbre=meilleur_arbre, X=X_oos_sc)
+        if not np.isfinite(prev).all(): prev = np.zeros(len(idx_oos))
+    return pd.Series(data=prev, index=idx_oos, name=f"GP(pop={n_individus})")
+
+
+def prevoir_gep_oos(serie: pd.Series, taille_tete: int = 6, n_genes: int = 3, n_pop: int = 50, n_gen: int = 20, verbose: bool = True) -> pd.Series:
+    """Prevoit par GEP sur OOS."""
+    X_train, y_train, _, _, _, _ = preparer_train_test(serie=serie)
+    X_oos, idx_oos = preparer_oos(serie=serie)
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train); X_oos_sc = scaler.transform(X_oos)
+    n_fonctions = len(_GEP_NOM_FONCTIONS); n_terminaux = X_train_sc.shape[1]
+    longueur_chromosome = (taille_tete + taille_tete + 1) * n_genes
+    np.random.seed(SEED)
+    population = [np.random.randint(0, n_fonctions+n_terminaux, longueur_chromosome).tolist() for _ in range(n_pop)]
+    def fitness(chrom):
+        try:
+            y_hat = _evaluer_chromosome_gep(chrom, X_train_sc, taille_tete)
+            if not np.isfinite(y_hat).all(): return -np.inf
+            return -float(np.sqrt(np.mean((y_hat - y_train)**2)))
+        except: return -np.inf
+    meilleur_chrom = None; meilleure_fitness = -np.inf
+    for _ in range(n_gen):
+        scores = [fitness(c) for c in population]
+        idx_max = int(np.argmax(scores))
+        if scores[idx_max] > meilleure_fitness: meilleure_fitness = scores[idx_max]; meilleur_chrom = population[idx_max].copy()
+        nouvelle_pop = []
+        for _ in range(n_pop):
+            c1 = np.random.choice(n_pop,3,replace=False); p1 = population[c1[int(np.argmax([scores[c] for c in c1]))]].copy()
+            c2 = np.random.choice(n_pop,3,replace=False); p2 = population[c2[int(np.argmax([scores[c] for c in c2]))]].copy()
+            pt = np.random.randint(1, longueur_chromosome); enfant = p1[:pt]+p2[pt:]
+            for k in range(longueur_chromosome):
+                if np.random.rand() < 1.0/longueur_chromosome: enfant[k] = np.random.randint(0, n_fonctions+n_terminaux)
+            nouvelle_pop.append(enfant)
+        population = nouvelle_pop
+    if meilleur_chrom is None: prev = np.zeros(len(idx_oos))
+    else:
+        prev = _evaluer_chromosome_gep(meilleur_chrom, X_oos_sc, taille_tete)
+        if not np.isfinite(prev).all(): prev = np.zeros(len(idx_oos))
+    return pd.Series(data=prev, index=idx_oos, name=f"GEP(h={taille_tete})")
+
+
+def prevoir_star_oos(serie: pd.Series, ordre: int, type_star: str = "LSTAR", verbose: bool = True) -> pd.Series:
+    """Prevoit par LSTAR ou ESTAR sur OOS."""
+    X_train, y_train, _, _, _, _ = preparer_train_test(serie=serie, n_lags=max(ordre, 1))
+    X_oos, idx_oos = preparer_oos(serie=serie, n_lags=max(ordre, 1))
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train); X_oos_sc = scaler.transform(X_oos)
+    fn_prev = _lstar_prevision if type_star == "LSTAR" else _estar_prevision
+    def objectif(params): return float(np.mean((fn_prev(params=params, X=X_train_sc) - y_train)**2))
+    np.random.seed(SEED)
+    params_init = np.zeros(2*(ordre+1)+2); params_init[-2] = 1.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = minimize(fun=objectif, x0=params_init, method="Nelder-Mead", options={"maxiter": 5000})
+    prev = fn_prev(params=res.x, X=X_oos_sc)
+    return pd.Series(data=prev, index=idx_oos, name=f"{type_star}({ordre})")
+
+
+# registre OOS : meme structure que _TACHES_NN mais avec les fonctions _oos
+_TACHES_NN_OOS = [
+    ("kNN(5)",        prevoir_knn_oos,      {"k": 5}),
+    ("MLP(h=5)",      prevoir_mlp_oos,      {"n_hidden": 5}),
+    ("RNN(h=5)",      prevoir_rnn_oos,      {"n_hidden": 5}),
+    ("HONN(ordre=2)", prevoir_honn_oos,     {"n_hidden": 5, "ordre": 2}),
+    ("PSN(h=5)",      prevoir_psn_oos,      {"n_hidden": 5}),
+    ("ARBF-PSO(k=5)", prevoir_arbf_pso_oos, {"n_centres": 5, "n_particules": 20, "n_iterations": 50}),
+    ("GP(pop=500)",   prevoir_gp_oos,       {"n_individus": 500, "n_generations": 10}),
+    ("GEP(h=6)",      prevoir_gep_oos,      {"taille_tete": 6, "n_genes": 3, "n_pop": 50, "n_gen": 20}),
+]
+
+
+def generer_previsions_nonlineaires_facteur_oos(serie: pd.Series, nom_facteur: str, meilleur_star: dict, verbose: bool = True) -> pd.DataFrame:
+    """Genere les previsions non lineaires OOS pour un facteur. meilleur_star = {facteur: (type, ordre)}."""
+    if verbose:
+        print(f"\n  Facteur OOS NL : {nom_facteur}")
+
+    resultats = {}
+    for nom, fn, kwargs in _TACHES_NN_OOS:
+        resultats[nom] = fn(serie=serie, verbose=False, **kwargs)
+
+    # STAR : utiliser le meme ordre que celui selectionne in-sample
+    type_star_opt, ordre_opt = meilleur_star.get(nom_facteur, ("LSTAR", 1))
+    nom_star = f"{type_star_opt}({ordre_opt})"
+    resultats[nom_star] = prevoir_star_oos(serie=serie, ordre=ordre_opt, type_star=type_star_opt, verbose=False)
+
+    return pd.DataFrame(data=resultats)
+
+
+def executer_previsions_nonlineaires_oos(meilleur_star: dict, verbose: bool = True) -> dict:
+    """Genere les previsions non lineaires OOS pour les 5 facteurs et sauvegarde en CSV."""
+    print("ETAPE 02_FORECASTING INDIVIDUAL NONLINEAR OOS ============") if verbose else None
+
+    df_log = charger_log_rendements(verbose=verbose)
+    previsions_par_facteur = {}
+
+    for facteur in FACTEURS:
+        serie   = df_log[facteur]
+        df_prev = generer_previsions_nonlineaires_facteur_oos(
+            serie=serie, nom_facteur=facteur, meilleur_star=meilleur_star, verbose=verbose
+        )
+        previsions_par_facteur[facteur] = df_prev
+
+    df_global = pd.concat(objs=previsions_par_facteur, axis=1)
+    df_global.columns.names = ["facteur", "modele"]
+    CHEMIN_SORTIE_OOS.parent.mkdir(parents=True, exist_ok=True)
+    df_global.to_csv(path_or_buf=CHEMIN_SORTIE_OOS, date_format="%Y-%m-%d")
+
+    if verbose:
+        print(f"\nPrevisions non lineaires OOS sauvegardees : {CHEMIN_SORTIE_OOS}")
+        print(f"Dimensions : {df_global.shape[0]} dates OOS x {df_global.shape[1]} colonnes")
+        print("ETAPE 02_FORECASTING INDIVIDUAL NONLINEAR OOS END ========")
+
+    return previsions_par_facteur
+
+
+def charger_previsions_nonlineaires_oos(verbose: bool = True) -> dict:
+    """Charge les previsions non lineaires OOS depuis le CSV multi-index."""
+    df_global = pd.read_csv(
+        filepath_or_buffer=CHEMIN_SORTIE_OOS,
+        index_col=0, parse_dates=True, date_format="%Y-%m-%d", header=[0, 1]
+    )
+    previsions_par_facteur = {facteur: df_global[facteur] for facteur in FACTEURS}
+    if verbose:
+        print(f"Previsions non lineaires OOS chargees : {df_global.shape[0]} dates")
+    return previsions_par_facteur
+
 # ==============================================================================
 # SECTION 12 : PIPELINE COMPLET POUR LES 5 FACTEURS
 # ==============================================================================
@@ -1114,5 +1440,16 @@ def charger_previsions_nonlineaires(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
-    previsions = executer_previsions_nonlineaires(verbose=True)
-    a = True
+    # previsions = executer_previsions_nonlineaires(verbose=True)
+    
+    # executer uniquement les previsions OOS (in-sample deja produit)
+    # meilleur_star : ordres STAR selectionnes lors du run in-sample
+    meilleur_star = {
+        "MKT": ("LSTAR", 3),
+        "SMB": ("LSTAR", 2),
+        "HML": ("LSTAR", 1),
+        "RMW": ("LSTAR", 3),
+        "CMA": ("ESTAR", 1)
+    }
+    executer_previsions_nonlineaires_oos(meilleur_star=meilleur_star, verbose=True)
+    a = True # pb
