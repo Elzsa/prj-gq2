@@ -59,7 +59,7 @@ git commit -m "Message de commit"
 git push origin nom-branche  # la branche sur laquelle push le code
 ```
 
-## Structure du projet
+## Structure du projet # TODO REVOIR
 ```
 PRJ-GQ2/
 │
