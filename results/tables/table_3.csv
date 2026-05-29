@@ -1,0 +1,21 @@
+Rang,MKT,SMB,HML,RMW,CMA
+Modele_1,PSN(h=5) [BEST],GP(pop=500) [BEST],"ARMA(2,2) [BEST]",EMA(19) [BEST],ESTAR(1) [BEST]
+Modele_2,"ARMA(7,11)","ARMA(15,3)","ARMA(4,6)","ARMA(5,12)","ARMA(11,2)"
+Modele_3,EMA(16),EMA(19),EMA(21),EMA(23),EMA(30)
+Modele_4,"ARMA(2,6)","ARMA(5,1)",SMA(23),"ARMA(3,1)","ARMA(6,2)"
+Modele_5,"ARMA(1,8)","ARMA(3,3)","ARMA(3,14)","ARMA(12,5)","ARMA(14,13)"
+Modele_6,"ARMA(10,5)","ARMA(8,2)","ARMA(3,1)","ARMA(4,6)","ARMA(3,3)"
+Modele_7,"ARMA(5,2)","ARMA(13,9)","ARMA(6,9)","ARMA(3,3)","ARMA(11,6)"
+Modele_8,"ARMA(1,2)",SMA(3),"ARMA(13,4)","ARMA(3,10)",AR(19)
+Modele_9,SMA(24),"ARMA(14,14)","ARMA(5,12)","ARMA(3,11)","ARMA(12,7)"
+Modele_10,"ARMA(1,1)","ARMA(13,6)","ARMA(12,4)","ARMA(8,10)","ARMA(12,2)"
+Modele_11,"ARMA(10,11)","ARMA(10,11)","ARMA(7,10)","ARMA(7,3)","ARMA(14,10)"
+Modele_12,AR(2),"ARMA(14,7)","ARMA(14,9)",AR(21),SMA(6)
+Modele_13,"ARMA(5,12)","ARMA(1,10)","ARMA(7,12)","ARMA(14,6)","ARMA(5,10)"
+Modele_14,RNN(h=5),"ARMA(1,11)","ARMA(7,14)","ARMA(4,4)","ARMA(8,4)"
+Modele_15,"ARMA(2,4)","ARMA(6,8)","ARMA(1,11)",HONN(ordre=2),"ARMA(14,4)"
+Modele_16,"ARMA(12,2)",PSN(h=5),GEP(h=6),"ARMA(10,14)",PSN(h=5)
+Modele_17,ARBF-PSO(k=5),ARBF-PSO(k=5),PSN(h=5),PSN(h=5),"ARMA(3,4)"
+Modele_18,,"ARMA(9,6)",kNN(5),"ARMA(12,10)",GEP(h=6)
+Modele_19,,HONN(ordre=2),,GP(pop=500),RNN(h=5)
+Modele_20,,GEP(h=6),,"ARMA(6,13)",
