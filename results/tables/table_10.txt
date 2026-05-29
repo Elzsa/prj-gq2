@@ -1,0 +1,51 @@
+TABLE 10 - Performances of different trading strategies (mean-99% CVaR)
+
+Panel A: Factors and 1/N portfolio
+Factors  Annualized return (%)  Return/CVaR  Sortino ratio  MDD (%)  CDB
+------------------------------------------------------------------------
+MKT                      3.680        0.269          0.308   54.108    -
+SMB                      3.772        0.386          0.511   22.657    -
+HML                      3.583        0.354          0.495   28.318    -
+RMW                      4.625        0.352          0.484   23.266    -
+CMA                      3.942        0.906          1.249   14.675    -
+1/N                      3.920        0.956          1.153   16.016  0.926
+
+Panel B: Mean-CVaR optimization without short-selling
+Models           Annualized return (%)  Return/CVaR  Sortino ratio  MDD (%)  CDB
+--------------------------------------------------------------------------------
+RW-DCC-SKT                       4.115        0.554          0.751   20.781  0.519
+RW-ADCC-SKT                      3.783        0.530          0.733   19.940  0.605
+RW-GAS-SKT                       3.906        0.566          0.785   22.250  0.644
+Average                          3.934        0.550          0.757   20.990  0.589
+SC-SVR-DCC-SKT                   3.701        0.349          0.479   34.779  0.000
+SC-SVR-ADCC-SKT                  3.855        0.363          0.493   33.749  0.000
+SC-SVR-GAS-SKT                   3.628        0.313          0.415   40.231    -
+Average                          3.728        0.342          0.462   36.253  0.000
+DMA-DCC-SKT                      2.626        0.452          0.557   17.883  0.836
+DMA-ADCC-SKT                     2.884        0.476          0.600   17.793  0.793
+DMA-GAS-SKT                      3.193        0.554          0.678   17.792  0.845
+Average                          2.901        0.494          0.612   17.823  0.825
+Total Average                    3.521        0.462          0.610   25.022  0.530
+DCC Average                      3.481        0.452          0.596   24.481  0.452
+ADCC Average                     3.507        0.456          0.609   23.827  0.466
+GAS Average                      3.575        0.478          0.626   26.758  0.744
+
+Panel C: Mean-CVaR optimization with short-selling (130/30 portfolios)
+Models             Annualized return (%)  Return/CVaR  Sortino ratio  MDD (%)  CDB
+----------------------------------------------------------------------------------
+RW-DCC-SKT-S                       4.722        0.614          0.767   22.269  0.610
+RW-ADCC-SKT-S                      4.238        0.495          0.630   22.021  0.419
+RW-GAS-SKT-S                       5.061        0.645          0.791   24.277  0.544
+Average                            4.674        0.585          0.729   22.856  0.524
+SC-SVR-DCC-SKT-S                   3.636        0.307          0.453   24.621    -
+SC-SVR-ADCC-SKT-S                  3.040        0.244          0.366   30.763    -
+SC-SVR-GAS-SKT-S                   3.762        0.322          0.462   31.277  0.000
+Average                            3.479        0.291          0.427   28.887  0.000
+DMA-DCC-SKT-S                      3.474        0.469          0.607   26.228  0.760
+DMA-ADCC-SKT-S                     3.823        0.540          0.667   25.991  0.784
+DMA-GAS-SKT-S                      3.914        0.535          0.676   27.677  0.812
+Average                            3.737        0.515          0.650   26.632  0.785
+Total Average - S                  3.963        0.463          0.602   26.125  0.561
+DCC-S Average                      3.944        0.463          0.609   24.373  0.685
+ADCC-S Average                     3.701        0.427          0.554   26.258  0.601
+GAS-S Average                      4.246        0.501          0.643   27.743  0.452

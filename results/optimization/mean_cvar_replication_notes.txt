@@ -1,0 +1,58 @@
+================================================================================
+NOTES DE RÉPLICATION — Section 5.2 (Mean-CVaR copule GH skewed-t)
+Zhao, Stasinakis, Sermpinis & Da Silva Fernandes (2019)
+Int J Fin Econ, 24, 1443-1463
+================================================================================
+DATE : 2026-05-29 12:22
+
+── FICHIERS ────────────────────────────────────────────────────────────────────
+  Rendements  : data/monthly_log_returns.csv
+  RF          : data/F-F_Research_Data_5_Factors_2x3.csv
+  Prévisions  : previsions_svr.csv, previsions_sc_svr.csv, previsions_dma.csv
+  Corrélations: correlations_dcc/adcc/gas.parquet
+  PIT         : results/ext/uniforms_pit.parquet
+  Résidus     : results/ext/residuals_garch.parquet
+  Cache GARCH : results/optimization/garch_vols_cache.csv
+
+── DIMENSIONS ──────────────────────────────────────────────────────────────────
+  Facteurs : MKT, SMB, HML, RMW, CMA (N=5)
+  OOS      : 2000-01-31 → 2017-07-31 (211 mois)
+  Q        : 5000 simulations Monte Carlo
+  Fenêtre  : 60 mois (Section 5.2, note 10)
+  Niveaux β: [0.95, 0.99]
+
+── PARAMÈTRES MARGINAUX HANSEN (1994) ──────────────────────────────────────────
+  MKT     : ν=15.2563  λ=-0.3670
+  SMB     : ν=11.3165  λ=+0.0854
+  HML     : ν=50.0000  λ=+0.0303
+  RMW     : ν=50.0000  λ=+0.1104
+  CMA     : ν=50.0000  λ=+0.1133
+
+── COPULE GH SKEWED-T (Demarta & McNeil 2005, Appendice D) ─────────────────────
+  Construction : X = γ_c W + √W Z,  W~InvGamma(ν_c/2, ν_c/2),  Z~N(0,R_t)
+  CDF marginale: quadrature Gauss-Laguerre généralisée (40 nœuds)
+  Estimation   : IFM 2 étapes (MLE ν_c via copule t, puis γ_c par mom.)
+  Corrélation  : R_t de DCC/ADCC/GAS fournie directement
+
+── OPTIMISATION ────────────────────────────────────────────────────────────────
+  Objectif   : max (μ_p − rf) / CVaR_β  (Section 5.2 : portefeuille tangent)
+  Méthode    : SLSQP multi-départ (6 starts long-only, 3 starts 130/30)
+  Alternative aux papier : sweep frontière N points → 1 optimisation SLSQP
+  Justification : return/CVaR est quasi-concave → SLSQP trouve le global optimum
+  Stratégie loop: simulation UNIQUE par (corr_model, date), partagée entre
+                  les 4 prévisions → 4× moins de simulations
+
+── PRÉDICTEUR "BEST" ────────────────────────────────────────────────────────────
+  Non calculé : best_individual.csv couvre uniquement IS (1965-1999).
+
+── ÉCARTS POTENTIELS AVEC LE PAPIER ────────────────────────────────────────────
+  1. Estimation copule : IFM 2 étapes vs MLE conjointe complète
+  2. SLSQP vs sweep de frontière LP (résultats équivalents, méthode différente)
+  3. Prédicteur "Best" absent (données OOS non disponibles)
+
+── COMPARAISON QUALITATIVE ATTENDUE (Tables 9 et 10) ───────────────────────────
+  DMA > SC-SVR > SVR > RW   (return/CVaR, Sortino)
+  GAS > ADCC > DCC           (modèle de corrélation)
+  130/30 > long-only         (grâce à la vente à découvert)
+  DMA-GAS-SKT best : return/CVaR ≈ 2.9-3.0, MDD ≈ 9.2%
+================================================================================
