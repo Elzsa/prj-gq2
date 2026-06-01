@@ -6,6 +6,8 @@ Auteurs : Yang Zhao | Charalampos Stasinakis | Georgios Sermpinis | Filipa Da Si
 Langage de programmation : Python  
 Étudiants : Arthur LE NET  | Loélia MEYER | Charlène JULIEN | Elsa PAYA
 
+Notre présentation et rapport complet se situe dans le dossier "rendu".
+
 ## Installation du projet (Windows et/ou MAC)
 
 1. Cloner le dépôt :
