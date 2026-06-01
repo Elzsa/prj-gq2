@@ -4,19 +4,6 @@
 """
 Simulation de Monte Carlo par copule skewed-t (Demarta & McNeil 2005)
 pour l'optimisation moyenne-CVaR.
-
-Suit fidèlement les Appendices B, C et D du papier :
-    Zhao, Stasinakis, Sermpinis & Da Silva Fernandes (2019)
-    Int J Fin Econ, 24, 1443-1463.
-
-Structure :
-    1. Distribution skewed-t de Hansen (1994) — modèles marginaux (Appendice B)
-       - PDF, CDF, PPF (inverse CDF), estimation MLE
-    2. Copule GH skewed-t (Demarta & McNeil 2005) — dépendance multivariée (Appendice D)
-       - CDF marginale via quadrature de Gauss-Laguerre généralisée
-       - Simulation par mélange normal-inverse gamma
-    3. Estimation des paramètres de la copule sur fenêtre roulante
-    4. Pipeline complet de simulation des rendements de portefeuille
 """
 
 import warnings
@@ -54,17 +41,6 @@ def _hansen_constants(nu: float, lam: float) -> tuple[float, float, float]:
     """
     Calcule les constantes a, b, c de la distribution skewed-t de Hansen (1994).
 
-    Paramètres
-    ----------
-    nu  : degrés de liberté (> 2)
-    lam : asymétrie (-1 < lam < 1)
-
-    Retourne
-    --------
-    (a, b, c) avec :
-        c = Γ((nu+1)/2) / (√(π(nu-2)) Γ(nu/2))
-        a = 4λc(nu-2)/(nu-1)
-        b = √(1 + 3λ² - a²)
     """
     c = gamma_func((nu + 1.0) / 2.0) / (
         np.sqrt(np.pi * (nu - 2.0)) * gamma_func(nu / 2.0)
@@ -78,12 +54,6 @@ def hansen_skt_pdf(z: np.ndarray, nu: float, lam: float) -> np.ndarray:
     """
     PDF de la distribution skewed-t de Hansen (1994).
     Hansen (1994) Int'l Economic Review, eq. (5).
-
-    Paramètres
-    ----------
-    z   : valeurs où évaluer la PDF (array ou scalaire)
-    nu  : degrés de liberté (> 2)
-    lam : asymétrie (-1 < lam < 1)
 
     Convention de normalisation : variance unitaire.
     """
@@ -100,12 +70,6 @@ def hansen_skt_pdf(z: np.ndarray, nu: float, lam: float) -> np.ndarray:
 def hansen_skt_cdf(z: np.ndarray, nu: float, lam: float) -> np.ndarray:
     """
     CDF de la distribution skewed-t de Hansen (1994).
-
-    La distribution t utilisée dans Hansen (1994) a pour kernel
-    (1 + x²/(nu-2))^{-(nu+1)/2}, soit la t de scipy(df=nu)
-    redimensionnée par √((nu-2)/nu).
-
-    Facteur de conversion : F_Hansen(x; nu) = F_scipy(x · √(nu/(nu-2)); df=nu)
     """
     a, b, c = _hansen_constants(nu, lam)
     z = np.asarray(z, dtype=float)
@@ -125,11 +89,6 @@ def hansen_skt_cdf(z: np.ndarray, nu: float, lam: float) -> np.ndarray:
 def hansen_skt_ppf(p: np.ndarray, nu: float, lam: float) -> np.ndarray:
     """
     Fonction quantile (inverse CDF) de la distribution skewed-t de Hansen (1994).
-
-    Pour p < (1-λ)/2 :
-        z = [(1-λ) · F_scipy^{-1}(p/(1-λ); df=nu) / scale - a] / b
-    Pour p ≥ (1-λ)/2 :
-        z = [(1+λ) · F_scipy^{-1}((p+λ)/(1+λ); df=nu) / scale - a] / b
     """
     a, b, c = _hansen_constants(nu, lam)
     p = np.asarray(p, dtype=float)
@@ -152,14 +111,6 @@ def fit_hansen_skt(residuals: np.ndarray) -> tuple[float, float]:
     """
     Estimation MLE des paramètres (nu, lam) de la distribution skewed-t
     de Hansen (1994) sur une série de résidus standardisés.
-
-    Paramètres
-    ----------
-    residuals : résidus standardisés (1D array)
-
-    Retourne
-    --------
-    (nu_hat, lam_hat) : degrés de liberté et asymétrie estimés
     """
     residuals = np.asarray(residuals, dtype=float)
     residuals = residuals[np.isfinite(residuals)]
@@ -205,10 +156,8 @@ def fit_hansen_skt(residuals: np.ndarray) -> tuple[float, float]:
 
 def _get_gl_nodes(alpha: float, n_nodes: int = 30) -> tuple[np.ndarray, np.ndarray]:
     """
-    Noeuds et poids de la quadrature de Gauss-Laguerre généralisée
-    ∫₀^∞ f(u) u^alpha e^{-u} du ≈ Σ_k w_k f(u_k).
-
-    Mise en cache par (alpha, n_nodes).
+    - Noeuds et poids de la quadrature de Gauss-Laguerre généralisée
+    -Mise en cache par (alpha, n_nodes).
     """
     key = (round(alpha, 6), n_nodes)
     if key not in _GL_NODES_CACHE:
@@ -227,23 +176,6 @@ def gh_skt_marginal_cdf_grid(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Pré-calcule la CDF marginale de la copule GH skewed-t sur une grille régulière.
-
-    La variable marginale X_i suit :
-        X_i | W ~ N(γ_i W, W)    où    W ~ InvGamma(ν_c/2, ν_c/2)
-
-    Par substitution U = ν_c/(2W), U ~ Gamma(ν_c/2, 1), on obtient :
-
-        F(x) = E_U[ Φ(x√(2U/ν_c) − γ_i√(ν_c/(2U))) ]
-             = (1/Γ(a)) ∫₀^∞ Φ(x√(2u/ν_c) − γ_i√(ν_c/(2u))) · u^{a-1} e^{-u} du
-
-    avec a = ν_c/2. Calculé via quadrature Gauss-Laguerre généralisée (ordre α=a-1).
-
-    Paramètres
-    ----------
-    nu_c     : degrés de liberté de la copule (> 2)
-    gamma_ci : asymétrie copule pour le facteur i
-    n_nodes  : nombre de noeuds de quadrature (défaut 40)
-    x_min, x_max, n_grid : paramètres de la grille
 
     Retourne
     --------
@@ -307,11 +239,7 @@ def _tcop_loglik(
     """
     Log-vraisemblance de la copule t symétrique (cas particulier γ_c = 0).
 
-    Utilisée pour estimer ν_c par MLE (étape 1 de la procédure en 2 étapes).
-
-    log L_t = Σ_t [log f_t(x_t; R_t, ν_c) - Σ_i log f_t(x_{it}; ν_c)]
-
-    où x_{it} = F_t^{-1}(u_{it}; df=ν_c) et F_t est la CDF de Student(ν_c).
+    Utilisée pour estimer ν_c par MLE
     """
     if nu_c <= 2.01:
         return -1e10
@@ -367,21 +295,6 @@ def estimate_copula_params(
     """
     Estimation des paramètres (ν_c, γ_c) de la copule GH skewed-t sur une fenêtre.
 
-    Procédure en 2 étapes (IFM simplifiée) :
-        Étape 1 : MLE de ν_c via la copule t symétrique (γ_c = 0)
-        Étape 2 : Estimation de γ_{c,i} par méthode des moments :
-                  γ_{c,i} ≈ [(nu_c - 2) / nu_c] * mean(F_t^{-1}(u_i))
-
-    La copule t est le cas particulier γ_c = 0 de la copule GH skewed-t.
-    L'asymétrie résiduelle dans les u_{i,t} est capturée par γ_{c,i}.
-
-    Paramètres
-    ----------
-    u_window : (T, n) — valeurs PIT uniformes sur la fenêtre
-    R_window : liste de T matrices de corrélation (n × n)
-    nu0      : point de départ pour ν_c
-    gamma0   : point de départ pour γ_c (None → zéros)
-
     Retourne
     --------
     (nu_c, gamma_c) : degrés de liberté et vecteur d'asymétrie copule
@@ -406,8 +319,6 @@ def estimate_copula_params(
     nu_c = float(np.clip(res.x[0] if res.success else nu0, 3.0, 50.0))
 
     # Étape 2 : γ_{c,i} par méthode des moments
-    # E[X_i] = γ_{c,i} * E[W] = γ_{c,i} * nu_c/(nu_c-2)
-    # → γ_{c,i} ≈ mean(x_{i,t}) * (nu_c-2)/nu_c
     u_clipped = np.clip(u_window, 1e-6, 1.0 - 1e-6)
     x_mat     = scipy_t.ppf(u_clipped, df=nu_c)  # (T, n)
     gamma_c   = x_mat.mean(axis=0) * (nu_c - 2.0) / nu_c
@@ -430,20 +341,6 @@ def simulate_gh_skt_copula(
     """
     Simule n_sims réalisations de la copule GH skewed-t (Demarta & McNeil 2005).
 
-    Algorithme (Appendice D, construction variance-mean mixture) :
-        1. W_m ~ InvGamma(ν_c/2, ν_c/2)
-        2. Z_m ~ N(0, R_t)  [multivariée avec matrice de corrélation R_t]
-        3. X_m = γ_c · W_m + √W_m · Z_m
-        4. U_{m,i} = F_{X_i}(X_{m,i})  [CDF marginale par grille GL pré-calculée]
-
-    Paramètres
-    ----------
-    R_t     : matrice de corrélation (n × n) à la date t
-    nu_c    : degrés de liberté de la copule
-    gamma_c : vecteur d'asymétrie (n,)
-    n_sims  : nombre de simulations
-    rng     : générateur aléatoire numpy
-
     Retourne
     --------
     U : (n_sims, n) — échantillons uniformes de la copule
@@ -456,7 +353,6 @@ def simulate_gh_skt_copula(
     W_m = scipy_invgamma.rvs(a=a, scale=a, size=n_sims, random_state=rng)  # (n_sims,)
 
     # Étape 2 : Z_m ~ N(0, R_t) via décomposition de Cholesky
-    # Correction PSD si nécessaire
     R_psd = _ensure_psd(R_t)
     try:
         L = np.linalg.cholesky(R_psd)
@@ -496,22 +392,6 @@ def simulate_portfolio_returns(
     """
     Simule n_sims vecteurs de rendements mensuels des 5 facteurs à la date t.
 
-    Pipeline complet (Section 5.2 et Appendices B, D) :
-        1. U_{m,i} ~ Copule GH skewed-t (R_t, ν_c, γ_c)
-        2. Z_{m,i} = G_i^{-1}(U_{m,i} ; η_i, λ_i^H)   [inverse skewed-t de Hansen]
-        3. r_{m,i,t} = μ_{i,t} + σ_{i,t} · Z_{m,i}
-
-    Paramètres
-    ----------
-    mu_t             : prévisions de rendements (n,) à la date t
-    sigma_t          : volatilités conditionnelles GARCH (n,) à la date t
-    R_t              : matrice de corrélation (n × n)
-    nu_c             : degrés de liberté copule
-    gamma_c          : asymétrie copule (n,)
-    marginal_params  : liste de (η_i, λ_i) pour chaque facteur i
-    n_sims           : nombre de simulations Q
-    seed             : graine aléatoire (optionnel)
-
     Retourne
     --------
     r_sim : (n_sims, n) — rendements simulés
@@ -528,7 +408,6 @@ def simulate_portfolio_returns(
         Z[:, i] = hansen_skt_ppf(u_i, eta_i, lam_i)
 
     # Étape 3 : reconstruction des rendements
-    # r_{m,i,t} = μ_{i,t} + σ_{i,t} · Z_{m,i}
     r_sim = mu_t[np.newaxis, :] + sigma_t[np.newaxis, :] * Z   # (Q, n)
 
     return r_sim
