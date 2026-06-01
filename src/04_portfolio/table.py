@@ -102,6 +102,11 @@ def _load_factor_returns_oos() -> pd.DataFrame:
     return monthly.loc[mask, FACTORS].copy()
 
 
+def _load_factor_returns_oos_simple() -> pd.DataFrame:
+    monthly_log = _load_factor_returns_oos()
+    return np.expm1(monthly_log)
+
+
 def _load_rf_oos(index: pd.DatetimeIndex) -> pd.Series:
     ff = pd.read_csv(FF_PATH, skiprows=4, index_col=0, dtype=str)
     ff = ff[ff.index.str.match(r"^\d{6}$", na=False)].copy()
@@ -181,23 +186,22 @@ def _compute_cdb(
     q: float = 0.01,
 ) -> float:
     """
-    Conditional Diversification Benefit.
+    Conditional Diversification Benefit, appliqué strictement selon l'Appendice E.
 
-    The original Christoffersen et al. formula assumes non-negative weights.
-    For 130/30 portfolios we therefore convert the average weights into
-    gross-normalized absolute exposures before computing the benchmark CVaR.
+    CDB_t(w_t, q) = (CVaR_bar_t^q - CVaR_t^q(w_t)) / (CVaR_bar_t^q - CVaR_underbar_t^q)
+    avec :
+        CVaR_bar_t^q      = sum_i w_i,t * CVaR_t^q(R_i,t)
+        CVaR_underbar_t^q = -F_{p,t}^{-1}(q)
+
+    Aucun retraitement ad hoc des poids n'est appliqué.
     """
-    exposures = np.abs(mean_weights.astype(float))
-    gross_exposure = float(exposures.sum())
-    if gross_exposure <= 0:
-        return np.nan
-    exposures /= gross_exposure
+    weights = mean_weights.astype(float)
 
     individual_cvars = np.array(
         [_cvar(factor_returns[:, idx], confidence_level=1.0 - q) for idx in range(factor_returns.shape[1])]
     )
 
-    cvar_bar = float(exposures @ individual_cvars)
+    cvar_bar = float(weights @ individual_cvars)
     cvar_portfolio = _cvar(portfolio_returns, confidence_level=1.0 - q)
     cvar_underbar = float(-np.quantile(portfolio_returns, q))
 
@@ -205,8 +209,7 @@ def _compute_cdb(
     if denominator <= 0 or np.isnan(denominator):
         return np.nan
 
-    cdb = (cvar_bar - cvar_portfolio) / denominator
-    return float(np.clip(cdb, 0.0, 1.0))
+    return float((cvar_bar - cvar_portfolio) / denominator)
 
 
 def _compute_metrics(
@@ -219,24 +222,22 @@ def _compute_metrics(
     if len(returns) < 2:
         return {column: np.nan for column in METRIC_COLUMNS}
 
-    rf_aligned = rf.reindex(returns.index).fillna(0.0).astype(float)
     factor_aligned = factor_returns.reindex(returns.index)[FACTORS].astype(float)
-    excess = returns - rf_aligned
 
-    ann_return_pct = float(np.expm1(returns.mean() * 12.0) * 100.0)
+    ann_return_pct = float(returns.mean() * 12.0 * 100.0)
 
-    std_excess = float(excess.std(ddof=1))
-    sharpe = float(excess.mean() / std_excess * np.sqrt(12.0)) if std_excess > 0 else np.nan
+    std_returns = float(returns.std(ddof=1))
+    sharpe = float(returns.mean() / std_returns * np.sqrt(12.0)) if std_returns > 0 else np.nan
 
-    negative_excess = excess[excess < 0]
-    std_negative = float(negative_excess.std(ddof=1)) if len(negative_excess) > 1 else np.nan
+    negative_returns = returns[returns < 0]
+    std_negative = float(negative_returns.std(ddof=1)) if len(negative_returns) > 1 else np.nan
     sortino = (
-        float(excess.mean() / std_negative * np.sqrt(12.0))
+        float(returns.mean() / std_negative * np.sqrt(12.0))
         if pd.notna(std_negative) and std_negative > 0
         else np.nan
     )
 
-    cumulative_value = np.exp(returns.cumsum())
+    cumulative_value = (1.0 + returns).cumprod()
     running_max = cumulative_value.cummax()
     drawdowns = (cumulative_value - running_max) / running_max
     mdd_pct = float(-drawdowns.min() * 100.0)
@@ -399,7 +400,7 @@ def build_panel_b_or_c(
 
 
 def build_table_8() -> pd.DataFrame:
-    factor_returns = _load_factor_returns_oos()
+    factor_returns = _load_factor_returns_oos_simple()
     rf = _load_rf_oos(factor_returns.index)
 
     panel_a = build_panel_a(factor_returns=factor_returns, rf=rf)
