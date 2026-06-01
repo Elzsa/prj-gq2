@@ -6,42 +6,6 @@ Section 5.2 — Optimisation Moyenne-CVaR par copule skewed-t
 Réplication fidèle de la Section 5.2 du papier :
     Zhao, Stasinakis, Sermpinis & Da Silva Fernandes (2019)
     Int J Fin Econ, 24, 1443-1463.
-
-Pipeline :
-    1. Chargement des données (rendements, prévisions, corrélations, PIT, résidus)
-    2. Estimation des paramètres marginaux Hansen skewed-t (Appendice B)
-    3. Volatilités GARCH(1,1) rolling avec cache disque
-    4. Estimation roulante des paramètres de copule GH skewed-t (60 mois, Appendice D)
-    5. Boucle principale — structure optimisée :
-         Pour chaque (corr_model, date) :
-           a. Simuler Q rendements avec mu=0 (copule + GARCH) — UNE SEULE FOIS
-           b. Pour chaque prev_model : r_sim = r_zero + mu_t
-           c. Maximiser directement (return − rf) / CVaR_β via SLSQP (Section 5.2)
-    6. Deux niveaux : β = 0.95 et β = 0.99
-    7. Deux cadres : long-only (Panel B) et 130/30 (Panel C)
-    8. Benchmarks : 1/N et RW
-    9. Métriques : rendement annualisé, return/CVaR, Sortino, MDD, CDB
-    10. Sauvegarde CSV
-
-Combinaisons (Tables 9 et 10 du papier) :
-    Prévisions × Corrélation = {RW, SVR, SC-SVR, DMA} × {DCC, ADCC, GAS}
-
-Remarque sur le prédicteur "Best" :
-    best_individual.csv ne couvre que l'IS (1965-1999) → absent des outputs OOS.
-    Les combinaisons "Best-XXX-SKT" ne sont pas calculées.
-
-Stratégie d'optimisation :
-    Le portefeuille tangent maximise directement (μ_p − rf) / CVaR_β (eq. 15 du
-    papier, Section 5.2). La CVaR est estimée empiriquement sur les Q rendements
-    simulés via la copule GH skewed-t. La maximisation utilise SLSQP avec
-    plusieurs points de départ, ce qui est plus rapide que le sweep de frontière
-    et converge vers le même optimum global (return/CVaR est quasi-concave).
-
-Performance attendue :
-    GARCH rolling (1× si cache absent) : ~20-30 min
-    Copule roulante                     : ~5-10 min
-    Optimisations CVaR (Q=5000)        : ~15-25 min
-    Total                               : ~45-65 min
 """
 
 import sys
@@ -52,11 +16,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
+from scipy.optimize import linprog
+from scipy import sparse
 from arch import arch_model
 from tqdm import tqdm
 
 from config.splits import OOS_START, OOS_END
+
+# Fenêtre OOS explicitement bornée au dernier mois disponible du papier/dataset.
+OOS_START_BOUND = pd.Timestamp("2000-01-01")
+OOS_END_BOUND   = pd.Timestamp("2017-07-31")
 
 # Import dynamique de monte_carlo.py (dossier "04_portfolio" non-importable directement)
 import importlib.util as _iutil
@@ -90,7 +59,7 @@ CHEMIN_PIT     = ROOT / "results" / "ext" / "uniforms_pit.parquet"
 CHEMIN_RESID   = ROOT / "results" / "ext" / "residuals_garch.parquet"
 
 DIR_RESULTS      = ROOT / "results" / "optimization"
-CACHE_GARCH_VOLS = DIR_RESULTS / "garch_vols_cache.csv"
+CACHE_GARCH_VOLS = DIR_RESULTS / "garch_vols_cache_mean_cvar_simple_exante.csv"
 DIR_RESULTS_CVAR = ROOT / "results" / "optimization_CVaR"
 DIR_RESULTS_95   = DIR_RESULTS_CVAR / "CVaR_95"
 DIR_RESULTS_99   = DIR_RESULTS_CVAR / "CVaR_99"
@@ -107,7 +76,7 @@ LONG_TARGET  = 1.30
 SHORT_TARGET = 0.30
 
 # Simulations Monte Carlo (Q = nombre de paths)
-# Q=5000 : bon compromis précision/vitesse avec SLSQP
+# Q=5000 : compromis précision/vitesse pour la prédiction de CVaR
 N_SIMS = 5_000
 
 # Niveaux de confiance CVaR
@@ -116,10 +85,7 @@ BETAS = [0.95, 0.99]
 # Graine globale pour reproductibilité
 GLOBAL_SEED = 42
 
-# Réglages SLSQP. Les warm-starts entre dates permettent de réduire les itérations.
-SLSQP_FTOL          = 1e-8
-SLSQP_MAXITER_LO    = 120
-SLSQP_MAXITER_13030 = 180
+LP_TOL = 1e-9
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -127,43 +93,82 @@ SLSQP_MAXITER_13030 = 180
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _charger_rendements() -> pd.DataFrame:
+    """
+    Charge les log-rendements mensuels des facteurs et les convertit en
+    rendements simples.
+
+    Le reste du pipeline travaille en rendements simples décimaux afin
+    d'agréger directement les poids, les simulations Monte Carlo et les
+    métriques de performance.
+    """
     df = pd.read_csv(
         CHEMIN_RETURNS, index_col=0, parse_dates=True, date_format="%Y-%m-%d"
     )
-    return df[FACTEURS]
+    return np.expm1(df[FACTEURS])
 
 
 def _charger_rf() -> pd.Series:
+    """
+    Charge le taux sans risque mensuel du fichier Fama-French brut.
+
+    Le champ `RF` est fourni en pourcentage mensuel par Ken French. Il est
+    converti ici en rendement simple décimal et réindexé en fin de mois pour
+    rester cohérent avec les séries de rendements et de prévisions.
+    """
     ff = pd.read_csv(CHEMIN_FF_RAW, skiprows=4, index_col=0, dtype=str)
     ff = ff[ff.index.str.match(r"^\d{6}$", na=False)].copy()
     rf = ff[["RF"]].apply(pd.to_numeric, errors="coerce").dropna()
     rf.index = pd.to_datetime(rf.index, format="%Y%m") + pd.offsets.MonthEnd(0)
     rf.index.name = "date"
-    return np.log(1.0 + rf["RF"] / 100.0)
+    return rf["RF"] / 100.0
 
 
 def _charger_previsions(chemin: Path) -> pd.DataFrame:
+    """
+    Charge un fichier de prévisions OOS et convertit les log-prévisions en
+    rendements simples.
+
+    """
     df = pd.read_csv(chemin, index_col=0, parse_dates=True, date_format="%Y-%m-%d")
-    return df[FACTEURS]
+    return np.expm1(df[FACTEURS])
 
 
 def _charger_previsions_rw(monthly: pd.DataFrame, oos_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Construit la prévision Random Walk utilisée comme benchmark prédictif.
+
+    """
     return monthly.shift(1).reindex(oos_dates)[FACTEURS]
 
 
 def _align_corr_to_eom(corr: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aligne les matrices de corrélation indexées en début de mois sur la fin de
+    mois correspondante.
+
+    Les fichiers DCC/ADCC/GAS sont datés au premier jour du mois tandis que les
+    rendements et les prévisions sont datés au dernier jour du mois.
+    """
     df = corr.copy()
     df.index = pd.to_datetime(df.index) + pd.offsets.MonthEnd(0)
     return df
 
 
 def _charger_pit() -> pd.DataFrame:
+    """
+    Charge les probabilités intégrales transformées (PIT) utilisées pour
+    l'estimation de la copule.
+    """
     pit = pd.read_parquet(CHEMIN_PIT)
     pit.index = pd.to_datetime(pit.index) + pd.offsets.MonthEnd(0)
     return pit[FACTEURS_CORR].rename(columns={"MKT_RF": "MKT"})
 
 
 def _charger_residus() -> pd.DataFrame:
+    """
+    Charge les résidus standardisés GARCH servant à calibrer les marginales
+    skewed-t de Hansen.
+    """
     resid = pd.read_parquet(CHEMIN_RESID)
     resid.index = pd.to_datetime(resid.index) + pd.offsets.MonthEnd(0)
     return resid[FACTEURS_CORR].rename(columns={"MKT_RF": "MKT"})
@@ -179,8 +184,8 @@ def _compute_garch_vol_rolling(
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
-    Volatilité conditionnelle GARCH(1,1) rolling (Appendice B).
-    Fenêtre de 60 mois. Cache disque dans results/optimization/garch_vols_cache.csv.
+    Prévision ex ante un pas de volatilité GARCH(1,1) rolling.
+    Fenêtre de 60 mois, estimée jusqu'à t-1 pour produire sigma_t|t-1.
     """
     # Charger le cache si disponible et complet
     if CACHE_GARCH_VOLS.exists():
@@ -204,8 +209,10 @@ def _compute_garch_vol_rolling(
                 idx_t = serie.index.get_loc(date_t)
             except KeyError:
                 continue
-            start  = max(0, idx_t - WINDOW_GARCH + 1)
-            window = serie.iloc[start : idx_t + 1]
+            if idx_t <= 0:
+                continue
+            start = max(0, idx_t - WINDOW_GARCH)
+            window = serie.iloc[start:idx_t]
             if len(window) < 10:
                 vols.at[date_t, facteur] = float(window.std()) if len(window) > 1 else np.nan
                 continue
@@ -215,7 +222,9 @@ def _compute_garch_vol_rolling(
                     mdl = arch_model(window * 100.0, mean="Zero", vol="GARCH",
                                      p=1, q=1, dist="normal", rescale=False)
                     fit = mdl.fit(disp="off", show_warning=False)
-                    vols.at[date_t, facteur] = float(fit.conditional_volatility.iloc[-1]) / 100.0
+                    fcst = fit.forecast(horizon=1, reindex=False)
+                    var_1 = float(fcst.variance.values[-1, 0])
+                    vols.at[date_t, facteur] = np.sqrt(max(var_1, 0.0)) / 100.0
             except Exception:
                 vols.at[date_t, facteur] = float(window.std())
 
@@ -232,7 +241,7 @@ def _compute_garch_vol_rolling(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _estimate_marginal_params(residus: pd.DataFrame) -> list[tuple[float, float]]:
-    """Estime (η_i, λ_i) de Hansen pour chaque facteur via MLE."""
+    """Estime (η_i, λ_i) de Hansen pour chaque facteur """
     params = []
     for f in FACTEURS:
         if f not in residus.columns:
@@ -249,6 +258,12 @@ def _estimate_marginal_params(residus: pd.DataFrame) -> list[tuple[float, float]
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_R_window(corr_df: pd.DataFrame, dates_window: pd.DatetimeIndex) -> list[np.ndarray]:
+    """
+    Reconstruit la séquence des matrices de corrélation d'une fenêtre roulante.
+
+    Une matrice identité est injectée si une date est absente.
+
+    """
     R_list = []
     for d in dates_window:
         if d in corr_df.index:
@@ -265,8 +280,8 @@ def _estimate_copula_rolling(
     label: str = "",
 ) -> dict[pd.Timestamp, tuple[float, np.ndarray]]:
     """
-    Estimation roulante (fenêtre 60 mois) des paramètres (ν_c, γ_c) de la copule.
-    Warm-starting entre dates consécutives.
+    Estimation roulante ex ante (fenêtre 60 mois) des paramètres (ν_c, γ_c).
+    La fenêtre s'arrête à t-1 pour respecter le one-step-ahead du papier.
     """
     copula_params: dict = {}
     nu0     = 8.0
@@ -274,7 +289,7 @@ def _estimate_copula_rolling(
     all_dt  = pit_df.index
 
     for date_t in tqdm(oos_dates, desc=f"  Copule {label}", leave=False):
-        idx_end   = np.searchsorted(all_dt, date_t, side="right") - 1
+        idx_end   = np.searchsorted(all_dt, date_t, side="left") - 1
         idx_start = max(0, idx_end - WINDOW_COPULA + 1)
         win_dates = all_dt[idx_start : idx_end + 1]
 
@@ -299,13 +314,12 @@ def _estimate_copula_rolling(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SECTION 5 : OPTIMISATION CVaR — MAXIMISATION DIRECTE DU RATIO RETURN/CVaR
+# SECTION 5 : OPTIMISATION CVaR — FORMULATION EXACTE DE L'ÉQUATION (15)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _tail_mean(losses: np.ndarray, beta: float) -> float:
     """
-    CVaR empirique via sélection partielle O(Q), plus rapide qu'un quantile complet.
-    On moyenne les plus grandes pertes dans la queue 1-β.
+    CVaR empirique via sélection partielle O(Q).
     """
     q = losses.shape[0]
     tail_count = max(1, int(np.ceil((1.0 - beta) * q)))
@@ -317,171 +331,149 @@ def _tail_mean(losses: np.ndarray, beta: float) -> float:
 def _portfolio_cvar(w: np.ndarray, r_sim: np.ndarray, beta: float) -> float:
     """
     Calcule la CVaR_β empirique sur Q rendements simulés.
-    CVaR = E[-r_p | -r_p ≥ VaR_β]  (convention perte positive).
     """
     losses = -(r_sim @ w)
     return _tail_mean(losses, beta)
 
 
-def _append_unique_start(starts: list[np.ndarray], candidate: np.ndarray | None) -> None:
-    """Ajoute un point de départ valide si aucun start équivalent n'existe déjà."""
-    if candidate is None:
-        return
-    cand = np.asarray(candidate, dtype=float)
-    if not np.all(np.isfinite(cand)):
-        return
-    for start in starts:
-        if np.allclose(start, cand, atol=1e-10, rtol=0.0):
-            return
-    starts.append(cand.copy())
-
-
-def _weights_to_13030_start(w: np.ndarray) -> np.ndarray:
-    """Reconstruit un état (longs, shorts) admissible à partir des poids nets."""
-    longs = np.maximum(w, 0.0)
-    shorts = np.maximum(-w, 0.0)
-
-    if longs.sum() <= 1e-12:
-        longs = np.full_like(longs, LONG_TARGET / len(w))
-    else:
-        longs *= LONG_TARGET / longs.sum()
-
-    if shorts.sum() <= 1e-12:
-        shorts = np.full_like(shorts, SHORT_TARGET / len(w))
-    else:
-        shorts *= SHORT_TARGET / shorts.sum()
-
-    return np.concatenate([longs, shorts])
-
-
-def _max_ratio_longonly(
+def _solve_lp_tangent_longonly(
     r_sim: np.ndarray,
     mu_t: np.ndarray,
     beta: float,
-    rf_t: float,
-    warm_start: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """
-    Portefeuille tangent long-only : argmax (μ_p − rf) / CVaR_β(p).
-
-    Section 5.2 du papier : "the one with higher Sharpe ratio or return/CVaR
-    ratio in the frontier". Ici maximisation directe via SLSQP.
-    CVaR est quasi-convexe en w, donc return/CVaR est quasi-concave : SLSQP
-    converge vers l'optimum global avec plusieurs initialisations.
-
-    Retourne
-    --------
-    (w_opt, ratio_opt, cvar_opt)
+    Portefeuille tangent long-only via la formulation exacte de Rockafellar-Uryasev
+    et une transformation linéaire-fractionnaire équivalente du ratio Return/CVaR.
     """
-    N = len(mu_t)
+    q, n = r_sim.shape
+    k = 1.0 / (q * (1.0 - beta))
+    idx_alpha = n
+    idx_u0 = n + 1
+    idx_t = n + 1 + q
+    n_vars = n + 1 + q + 1
 
-    def neg_ratio(w: np.ndarray) -> float:
-        cvar = _portfolio_cvar(w, r_sim, beta)
-        if cvar < 1e-10:
-            return 1e6
-        return -(float(mu_t @ w) - rf_t) / cvar
+    c = np.zeros(n_vars, dtype=float)
+    c[:n] = -mu_t
 
-    constraints = [{"type": "eq", "fun": lambda w: float(w.sum()) - 1.0}]
-    bounds      = [(0.0, 1.0)] * N
+    eq_budget = sparse.csr_matrix(
+        ([1.0] * n + [-1.0], ([0] * (n + 1), list(range(n)) + [idx_t])),
+        shape=(1, n_vars),
+    )
+    eq_norm = sparse.csr_matrix(
+        ([1.0] + [k] * q, ([0] * (q + 1), [idx_alpha] + list(range(idx_u0, idx_u0 + q)))),
+        shape=(1, n_vars),
+    )
+    a_eq = sparse.vstack([eq_budget, eq_norm], format="csr")
+    b_eq = np.array([0.0, 1.0], dtype=float)
 
-    starts: list[np.ndarray] = []
-    _append_unique_start(starts, warm_start)
-    _append_unique_start(starts, np.ones(N) / N)
-    for i in range(N):
-        _append_unique_start(starts, np.eye(N)[i] * 0.6 + np.ones(N) * 0.4 / N)
+    a_ub = sparse.hstack(
+        [
+            sparse.csr_matrix(-r_sim),
+            sparse.csr_matrix(-np.ones((q, 1))),
+            -sparse.eye(q, format="csr"),
+            sparse.csr_matrix((q, 1)),
+        ],
+        format="csr",
+    )
+    b_ub = np.zeros(q, dtype=float)
 
-    best_ratio = -np.inf
-    best_w     = np.ones(N) / N
+    bounds = [(0.0, None)] * n + [(None, None)] + [(0.0, None)] * q + [(1e-12, None)]
 
-    for w0 in starts:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                res = minimize(
-                    neg_ratio, w0, method="SLSQP",
-                    bounds=bounds, constraints=constraints,
-                    options={"ftol": SLSQP_FTOL, "maxiter": SLSQP_MAXITER_LO},
-                )
-            if res.success or res.status == 9:   # 9 = iteration limit (acceptable)
-                ratio = -float(res.fun)
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_w     = np.clip(res.x, 0.0, 1.0)
-                    best_w    /= best_w.sum()      # re-normalise
-        except Exception:
-            continue
+    res = linprog(
+        c,
+        A_ub=a_ub,
+        b_ub=b_ub,
+        A_eq=a_eq,
+        b_eq=b_eq,
+        bounds=bounds,
+        method="highs",
+        options={"primal_feasibility_tolerance": LP_TOL, "dual_feasibility_tolerance": LP_TOL},
+    )
+    if not res.success:
+        raise RuntimeError(f"LP long-only infeasible: {res.message}")
 
-    cvar_opt = _portfolio_cvar(best_w, r_sim, beta)
-    return best_w, best_ratio, cvar_opt
+    t_opt = float(res.x[idx_t])
+    w_opt = np.asarray(res.x[:n], dtype=float) / t_opt
+    w_opt = np.clip(w_opt, 0.0, None)
+    w_opt /= w_opt.sum()
+    cvar_opt = _portfolio_cvar(w_opt, r_sim, beta)
+    ratio_opt = float(mu_t @ w_opt) / cvar_opt if cvar_opt > 1e-12 else np.nan
+    return w_opt, ratio_opt, cvar_opt
 
 
-def _max_ratio_130_30(
+def _solve_lp_tangent_130_30(
     r_sim: np.ndarray,
     mu_t: np.ndarray,
     beta: float,
-    rf_t: float,
-    warm_start: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """
-    Portefeuille tangent 130/30 : argmax (μ_p − rf) / CVaR_β(p).
+    Portefeuille tangent 130/30 via la même formulation exacte.
     Décomposition w = l − s, sum(l)=1.30, sum(s)=0.30, l≥0, s≥0.
     """
-    N = len(mu_t)
+    q, n = r_sim.shape
+    k = 1.0 / (q * (1.0 - beta))
+    idx_alpha = 2 * n
+    idx_u0 = 2 * n + 1
+    idx_t = 2 * n + 1 + q
+    n_vars = 2 * n + 1 + q + 1
 
-    def neg_ratio_130(x: np.ndarray) -> float:
-        w    = x[:N] - x[N:]
-        cvar = _portfolio_cvar(w, r_sim, beta)
-        if cvar < 1e-10:
-            return 1e6
-        return -(float(mu_t @ w) - rf_t) / cvar
+    c = np.zeros(n_vars, dtype=float)
+    c[:n] = -mu_t
+    c[n : 2 * n] = mu_t
 
-    constraints = [
-        {"type": "eq", "fun": lambda x: float(x[:N].sum()) - LONG_TARGET},
-        {"type": "eq", "fun": lambda x: float(x[N:].sum()) - SHORT_TARGET},
-    ]
-    bounds = [(0.0, None)] * (2 * N)
+    eq_long = sparse.csr_matrix(
+        ([1.0] * n + [-LONG_TARGET], ([0] * (n + 1), list(range(n)) + [idx_t])),
+        shape=(1, n_vars),
+    )
+    eq_short = sparse.csr_matrix(
+        ([1.0] * n + [-SHORT_TARGET], ([0] * (n + 1), list(range(n, 2 * n)) + [idx_t])),
+        shape=(1, n_vars),
+    )
+    eq_norm = sparse.csr_matrix(
+        ([1.0] + [k] * q, ([0] * (q + 1), [idx_alpha] + list(range(idx_u0, idx_u0 + q)))),
+        shape=(1, n_vars),
+    )
+    a_eq = sparse.vstack([eq_long, eq_short, eq_norm], format="csr")
+    b_eq = np.array([0.0, 0.0, 1.0], dtype=float)
 
-    x0_base = np.concatenate([
-        np.full(N, LONG_TARGET / N),
-        np.full(N, SHORT_TARGET / N),
-    ])
+    a_ub = sparse.hstack(
+        [
+            sparse.csr_matrix(-r_sim),
+            sparse.csr_matrix(r_sim),
+            sparse.csr_matrix(-np.ones((q, 1))),
+            -sparse.eye(q, format="csr"),
+            sparse.csr_matrix((q, 1)),
+        ],
+        format="csr",
+    )
+    b_ub = np.zeros(q, dtype=float)
 
-    # 3 points de départ (base + 2 perturbations)
-    rng_starts = np.random.default_rng(0)
-    starts: list[np.ndarray] = []
-    _append_unique_start(starts, warm_start)
-    _append_unique_start(starts, x0_base)
-    for _ in range(2):
-        noise = rng_starts.normal(0, 0.02, 2 * N)
-        x_pert = x0_base + noise
-        x_pert[:N]  = np.maximum(x_pert[:N], 0)
-        x_pert[:N] *= LONG_TARGET / x_pert[:N].sum()
-        x_pert[N:]  = np.maximum(x_pert[N:], 0)
-        x_pert[N:] *= SHORT_TARGET / x_pert[N:].sum()
-        _append_unique_start(starts, x_pert)
+    bounds = (
+        [(0.0, None)] * n
+        + [(0.0, None)] * n
+        + [(None, None)]
+        + [(0.0, None)] * q
+        + [(1e-12, None)]
+    )
 
-    best_ratio = -np.inf
-    best_w     = np.full(N, LONG_TARGET / N) - np.full(N, SHORT_TARGET / N)
+    res = linprog(
+        c,
+        A_ub=a_ub,
+        b_ub=b_ub,
+        A_eq=a_eq,
+        b_eq=b_eq,
+        bounds=bounds,
+        method="highs",
+        options={"primal_feasibility_tolerance": LP_TOL, "dual_feasibility_tolerance": LP_TOL},
+    )
+    if not res.success:
+        raise RuntimeError(f"LP 130/30 infeasible: {res.message}")
 
-    for x0 in starts:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                res = minimize(
-                    neg_ratio_130, x0, method="SLSQP",
-                    bounds=bounds, constraints=constraints,
-                    options={"ftol": SLSQP_FTOL, "maxiter": SLSQP_MAXITER_13030},
-                )
-            if res.success or res.status == 9:
-                ratio = -float(res.fun)
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_w     = res.x[:N] - res.x[N:]
-        except Exception:
-            continue
-
-    cvar_opt = _portfolio_cvar(best_w, r_sim, beta)
-    return best_w, best_ratio, cvar_opt
+    t_opt = float(res.x[idx_t])
+    w_opt = (np.asarray(res.x[:n], dtype=float) - np.asarray(res.x[n : 2 * n], dtype=float)) / t_opt
+    cvar_opt = _portfolio_cvar(w_opt, r_sim, beta)
+    ratio_opt = float(mu_t @ w_opt) / cvar_opt if cvar_opt > 1e-12 else np.nan
+    return w_opt, ratio_opt, cvar_opt
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -504,11 +496,8 @@ def _compute_metrics(
     if len(r) < 2:
         return {}
 
-    rf_al  = rf.reindex(r.index).fillna(0.0)
-    excess = r - rf_al
-
-    # Rendement annualisé : log-rendement moyen × 12 → rendement simple
-    ann_ret = float(np.expm1(r.mean() * 12.0)) * 100.0
+    # Rendement annualisé en convention arithmétique sur rendements simples
+    ann_ret = float(r.mean() * 12.0) * 100.0
 
     # Return/CVaR
     cvar_al = cvar_series.reindex(r.index).dropna()
@@ -517,14 +506,14 @@ def _compute_metrics(
     else:
         ret_cvar = np.nan
 
-    # Sortino ratio annualisé
-    neg_ex = excess[excess < 0]
-    std_neg = float(neg_ex.std(ddof=1)) if len(neg_ex) > 1 else np.nan
-    sortino = float(excess.mean() / std_neg) * np.sqrt(12.0) if (std_neg and std_neg > 0) else np.nan
+    # Sortino ratio annualisé sans soustraction du taux sans risque
+    neg_r = r[r < 0]
+    std_neg = float(neg_r.std(ddof=1)) if len(neg_r) > 1 else np.nan
+    sortino = float(r.mean() / std_neg) * np.sqrt(12.0) if (std_neg and std_neg > 0) else np.nan
 
-    # Maximum Drawdown
-    cum = np.exp(r.cumsum())
-    mdd = float(((cum - cum.cummax()) / cum.cummax()).min()) * 100.0
+    # Maximum Drawdown sur la valeur cumulée d'un portefeuille en rendements simples
+    cum = (1.0 + r).cumprod()
+    mdd = -float(((cum - cum.cummax()) / cum.cummax()).min()) * 100.0
 
     return {
         "ann_return_pct": ann_ret,
@@ -535,16 +524,16 @@ def _compute_metrics(
     }
 
 
-def _compute_sharpe_ratio(returns: pd.Series, rf: pd.Series) -> float:
-    """Sharpe ratio OOS mensuel, utilisé pour identifier le meilleur tangent."""
+def _compute_return_cvar_ratio(returns: pd.Series, cvar_series: pd.Series) -> float:
+    """Score OOS cohérent avec la tangence mean-CVaR : moyenne(r) / moyenne(CVaR)."""
     r = returns.dropna()
-    if len(r) < 2:
+    cvar_al = cvar_series.reindex(r.index).dropna()
+    if len(cvar_al) == 0:
         return np.nan
-    excess = r - rf.reindex(r.index).fillna(0.0)
-    std = float(excess.std(ddof=1))
-    if not np.isfinite(std) or std <= 0.0:
+    cvar_mean = float(cvar_al.mean())
+    if not np.isfinite(cvar_mean) or cvar_mean <= 0.0:
         return np.nan
-    return float(excess.mean()) / std
+    return float(r.reindex(cvar_al.index).mean()) / cvar_mean
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -552,12 +541,18 @@ def _compute_sharpe_ratio(returns: pd.Series, rf: pd.Series) -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_meancvar_optimization(verbose: bool = True) -> None:
-    """Pipeline complet — Section 5.2 du papier."""
+    """
+    Exécute l'intégralité du pipeline moyenne-CVaR décrit en section 5.2.
+
+    Les résultats produits sont des séries de poids, de rendements réalisés et
+    de CVaR ex ante, puis des fichiers de synthèse sauvegardés sous
+    `results/optimization_CVaR/`.
+    """
     if verbose:
         print("=" * 70)
         print("SECTION 5.2 — OPTIMISATION MOYENNE-CVaR (copule GH skewed-t)")
         print("Zhao et al. (2019) — Tables 9 et 10")
-        print(f"Q={N_SIMS} simulations, β={BETAS}, méthode=SLSQP direct")
+        print(f"Q={N_SIMS} simulations, β={BETAS}, méthode=LP exact (eq. 15)")
         print("=" * 70)
 
     DIR_RESULTS.mkdir(parents=True, exist_ok=True)
@@ -575,7 +570,7 @@ def run_meancvar_optimization(verbose: bool = True) -> None:
     pit_df    = _charger_pit()
     resid_df  = _charger_residus()
 
-    mask_oos    = (monthly.index >= OOS_START) & (monthly.index <= OOS_END)
+    mask_oos    = (monthly.index >= OOS_START_BOUND) & (monthly.index <= OOS_END_BOUND)
     monthly_oos = monthly.loc[mask_oos].copy()
     rf_oos      = rf_series.reindex(monthly_oos.index).fillna(0.0)
     oos_dates   = monthly_oos.index
@@ -602,7 +597,6 @@ def run_meancvar_optimization(verbose: bool = True) -> None:
         name: df.reindex(oos_dates)
         for name, df in modeles_corr.items()
     }
-    rf_arr = rf_oos.reindex(oos_dates).to_numpy(dtype=float)
     real_arr = monthly_oos[FACTEURS].to_numpy(dtype=float)
 
     # ── 2. Paramètres marginaux Hansen ───────────────────────────────────────
@@ -636,7 +630,7 @@ def run_meancvar_optimization(verbose: bool = True) -> None:
     # ── 5. Boucle principale ─────────────────────────────────────────────────
     if verbose:
         print("\n[5/6] Optimisation moyenne-CVaR...")
-        print("  Mode rapide actif : SLSQP direct, aucun LP, 1 simulation par (corr_model, date)")
+        print("  Portefeuille tangent obtenu par programmation linéaire exacte.")
 
     # Initialisation des conteneurs de résultats
     # Clé : "{prev}-{corr}-SKT-{beta_pct}-{panel}"
@@ -654,8 +648,6 @@ def run_meancvar_optimization(verbose: bool = True) -> None:
                     cvar_store[k]    = {}
 
     seed_gen = np.random.default_rng(GLOBAL_SEED)
-    warm_lo: dict[tuple[str, str, float], np.ndarray] = {}
-    warm_130: dict[tuple[str, str, float], np.ndarray] = {}
 
     # Boucle externe : modèle de corrélation (3 × 211 simulations)
     for corr_name, corr_df in corr_aligned.items():
@@ -665,7 +657,6 @@ def run_meancvar_optimization(verbose: bool = True) -> None:
 
             # ── Données communes à la date t ──────────────────────────────
             sig_vec = sigma_arr[idx_t]
-            rf_t = float(rf_arr[idx_t]) if np.isfinite(rf_arr[idx_t]) else 0.0
             r_real = real_arr[idx_t]
 
             if np.any(~np.isfinite(sig_vec)) or np.any(sig_vec <= 0) or np.any(~np.isfinite(r_real)):
@@ -709,23 +700,22 @@ def run_meancvar_optimization(verbose: bool = True) -> None:
                 for beta in BETAS:
                     # Panel B : long-only
                     k_lo = f"{prev_name}-{corr_name}-SKT-{int(beta*100)}-lo"
-                    warm_key = (prev_name, corr_name, beta)
-                    w_lo, ratio_lo, cvar_lo = _max_ratio_longonly(
-                        r_sim, mu_vec, beta, rf_t, warm_start=warm_lo.get(warm_key)
-                    )
+                    try:
+                        w_lo, ratio_lo, cvar_lo = _solve_lp_tangent_longonly(r_sim, mu_vec, beta)
+                    except Exception:
+                        ratio_lo = np.nan
                     if np.isfinite(ratio_lo):
-                        warm_lo[warm_key] = w_lo.copy()
                         weights_store[k_lo][date_t] = w_lo
                         returns_store[k_lo][date_t] = float(r_real @ w_lo)
                         cvar_store[k_lo][date_t]    = cvar_lo
 
                     # Panel C : 130/30
                     k_130 = f"{prev_name}-{corr_name}-SKT-{int(beta*100)}-130"
-                    w_130, ratio_130, cvar_130 = _max_ratio_130_30(
-                        r_sim, mu_vec, beta, rf_t, warm_start=warm_130.get(warm_key)
-                    )
+                    try:
+                        w_130, ratio_130, cvar_130 = _solve_lp_tangent_130_30(r_sim, mu_vec, beta)
+                    except Exception:
+                        ratio_130 = np.nan
                     if np.isfinite(ratio_130):
-                        warm_130[warm_key] = _weights_to_13030_start(w_130)
                         weights_store[k_130][date_t] = w_130
                         returns_store[k_130][date_t] = float(r_real @ w_130)
                         cvar_store[k_130][date_t]    = cvar_130
@@ -740,7 +730,6 @@ def run_meancvar_optimization(verbose: bool = True) -> None:
         verbose=verbose,
     )
 
-    # ── Notes de réplication ──────────────────────────────────────────────────
     _write_replication_notes(marginal_params=marginal_params, n_oos=len(oos_dates))
 
     if verbose:
@@ -764,7 +753,9 @@ def _save_results(
     modeles_corr: dict,
     verbose: bool = True,
 ) -> None:
-    """Sauvegarde les 8 CSV de poids/rendements + résumé de performance."""
+    """
+    Sauvegarde les sorties consolidées de la section mean-CVaR.
+    """
 
     N      = N_FACTORS
     oos_dates = monthly_oos.index
@@ -792,7 +783,7 @@ def _save_results(
         beta_dir = DIR_RESULTS_95 if beta_str == 95 else DIR_RESULTS_99
         for panel_sfx, panel_label in [("lo", "long_only"), ("130", "130_30")]:
             all_w, all_r = [], []
-            best_sharpe = -np.inf
+            best_score = -np.inf
             best_label = None
             best_w_df = None
             best_r_df = None
@@ -820,9 +811,9 @@ def _save_results(
                 row_r = pd.DataFrame({"model": label, "portfolio_return": r_s, "portfolio_cvar": c_s})
                 all_r.append(row_r)
 
-                sharpe = _compute_sharpe_ratio(r_s, rf_oos)
-                if np.isfinite(sharpe) and sharpe > best_sharpe:
-                    best_sharpe = sharpe
+                score = _compute_return_cvar_ratio(r_s, c_s)
+                if np.isfinite(score) and score > best_score:
+                    best_score = score
                     best_label = label
                     best_w_df = row_w.copy()
                     best_r_df = row_r.copy()
@@ -869,6 +860,10 @@ def _write_replication_notes(
     marginal_params: list[tuple[float, float]],
     n_oos: int,
 ) -> None:
+    """
+    Cétape d'exécution: période OOS, paramètres marginaux,
+    choix de simulation et écarts assumés par rapport à l'article.
+    """
     notes = f"""================================================================================
 NOTES DE RÉPLICATION — Section 5.2 (Mean-CVaR copule GH skewed-t)
 Zhao, Stasinakis, Sermpinis & Da Silva Fernandes (2019)
@@ -883,7 +878,7 @@ DATE : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
   Corrélations: correlations_dcc/adcc/gas.parquet
   PIT         : results/ext/uniforms_pit.parquet
   Résidus     : results/ext/residuals_garch.parquet
-  Cache GARCH : results/optimization/garch_vols_cache.csv
+  Cache GARCH : results/optimization/garch_vols_cache_mean_cvar_simple_exante.csv
 
 ── DIMENSIONS ──────────────────────────────────────────────────────────────────
   Facteurs : MKT, SMB, HML, RMW, CMA (N=5)
@@ -904,10 +899,9 @@ DATE : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
   Corrélation  : R_t de DCC/ADCC/GAS fournie directement
 
 ── OPTIMISATION ────────────────────────────────────────────────────────────────
-  Objectif   : max (μ_p − rf) / CVaR_β  (Section 5.2 : portefeuille tangent)
-  Méthode    : SLSQP multi-départ (6 starts long-only, 3 starts 130/30)
-  Alternative aux papier : sweep frontière N points → 1 optimisation SLSQP
-  Justification : return/CVaR est quasi-concave → SLSQP trouve le global optimum
+  Objectif   : max μ_p / CVaR_β  (portefeuille tangent de la frontière mean-CVaR)
+  Méthode    : programmation linéaire exacte issue de l'équation (15)
+  Horizon    : prévisions ex ante un pas (GARCH et copule estimés jusqu'à t-1)
   Stratégie loop: simulation UNIQUE par (corr_model, date), partagée entre
                   les 4 prévisions → 4× moins de simulations
 
@@ -916,8 +910,7 @@ DATE : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
 
 ── ÉCARTS POTENTIELS AVEC LE PAPIER ────────────────────────────────────────────
   1. Estimation copule : IFM 2 étapes vs MLE conjointe complète
-  2. SLSQP vs sweep de frontière LP (résultats équivalents, méthode différente)
-  3. Prédicteur "Best" absent (données OOS non disponibles)
+  2. Prédicteur "Best" absent (données OOS non disponibles)
 
 ── COMPARAISON QUALITATIVE ATTENDUE (Tables 9 et 10) ───────────────────────────
   DMA > SC-SVR > SVR > RW   (return/CVaR, Sortino)
