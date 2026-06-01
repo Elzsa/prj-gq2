@@ -18,20 +18,6 @@ Pipeline complet :
     6. Benchmark 1/N (portefeuille équipondéré)
     7. Sauvegarde des résultats
 
-Combinaisons testées (Section 5.1, Table 8 du papier) :
-    Prévisions : RW | SC-SVR | DMA
-    Covariance : DCC-GARCH | ADCC-GARCH | GAS
-
-Conventions :
-    - Les log-rendements sont dans monthly_log_returns.csv (unité décimale).
-    - Les matrices de corrélation sont indexées en début de mois (2000-01-01),
-      converties en fin de mois pour alignement avec les rendements.
-    - Le taux sans risque provient du fichier Ken French (RF en %).
-    - Les volatilités GARCH(1,1) sont estimées sur des fenêtres roulantes de 60
-      mois, en accord avec garch.py (src/dependance/garch.py).
-    - La stratégie 130/30 est implémentée par décomposition : w = l - s,
-      avec sum(l) = 1.30 et sum(s) = 0.30, l >= 0, s >= 0.
-
 Sorties :
     results/optimization/           — toutes les séries de poids et rendements
     results/optimization/best_portfolio_tangent/ — portefeuilles tangents (CSV)
@@ -50,6 +36,10 @@ from arch import arch_model
 from tqdm import tqdm
 
 from config.splits import OOS_START, OOS_END
+
+# Fenêtre OOS explicitement bornée au dernier mois disponible du papier/dataset.
+OOS_START_BOUND = pd.Timestamp("2000-01-01")
+OOS_END_BOUND   = pd.Timestamp("2017-07-31")
 
 # ==============================================================================
 # CHEMINS ET CONSTANTES
@@ -91,30 +81,28 @@ SHORT_TARGET = 0.30   # exposition courte totale (valeur absolue)
 
 def _charger_rendements() -> pd.DataFrame:
     """
-    Charge les log-rendements mensuels des 5 facteurs (1965-01 à 2017-07).
+    Charge les rendements mensuels simples des 5 facteurs (1965-01 à 2017-07).
     Source : data/monthly_log_returns.csv
-    Unité  : log-rendements décimaux, ex. 0.034 = 3.4%/mois en log-rendement.
+    Le fichier source contient des log-rendements décimaux, convertis ici en
+    rendements simples décimaux via exp(r_log) - 1.
     """
     df = pd.read_csv(
         CHEMIN_RETURNS, index_col=0, parse_dates=True, date_format="%Y-%m-%d"
     )
-    return df[FACTEURS]
+    return np.expm1(df[FACTEURS])
 
 
 def _charger_rf() -> pd.Series:
     """
-    Charge le taux sans risque mensuel de Ken French et le convertit en
-    log-rendement décimal.
-    Le fichier FF donne RF en % (ex. 0.41 = 0.41%/mois).
+    Charge le taux sans risque mensuel de Ken French en rendement simple
+    décimal.
     """
     ff = pd.read_csv(CHEMIN_FF_RAW, skiprows=4, index_col=0, dtype=str)
     ff = ff[ff.index.str.match(r"^\d{6}$", na=False)].copy()
     rf = ff[["RF"]].apply(pd.to_numeric, errors="coerce").dropna()
     rf.index = pd.to_datetime(rf.index, format="%Y%m") + pd.offsets.MonthEnd(0)
     rf.index.name = "date"
-    # Conversion : % -> log-rendement
-    rf_log = np.log(1.0 + rf["RF"] / 100.0)
-    return rf_log
+    return rf["RF"] / 100.0
 
 
 def _charger_previsions_rw(monthly: pd.DataFrame) -> pd.DataFrame:
@@ -122,15 +110,15 @@ def _charger_previsions_rw(monthly: pd.DataFrame) -> pd.DataFrame:
     Prévisions Random Walk (RW) : prévision pour t = rendement réalisé en t-1.
     Cohérent avec evaluation.py : charger_previsions_rw().
     """
-    df = monthly[monthly.index <= OOS_END].shift(1)
-    masque = (df.index >= OOS_START) & (df.index <= OOS_END)
+    df = monthly[monthly.index <= OOS_END_BOUND].shift(1)
+    masque = (df.index >= OOS_START_BOUND) & (df.index <= OOS_END_BOUND)
     return df.loc[masque, FACTEURS]
 
 
 def _charger_previsions(chemin: Path) -> pd.DataFrame:
-    """Charge un fichier de prévisions OOS (SC-SVR ou DMA)."""
+    """Charge un fichier de prévisions OOS et convertit les log-prévisions en rendements simples."""
     df = pd.read_csv(chemin, index_col=0, parse_dates=True, date_format="%Y-%m-%d")
-    return df[FACTEURS]
+    return np.expm1(df[FACTEURS])
 
 
 def _charger_correlations(chemin: Path) -> pd.DataFrame:
@@ -164,23 +152,6 @@ def _compute_garch_vol_rolling(
     """
     Calcule la volatilité conditionnelle GARCH(1,1) rolling pour chaque facteur.
 
-    Méthode (cohérente avec garch.py, Appendice B du papier) :
-        - Pour chaque date t dans oos_dates, on estime GARCH(1,1) sur la
-          fenêtre [t - 60 mois + 1 : t] incluse (60 mois).
-        - On extrait conditional_volatility.iloc[-1] comme sigma_{i,t}.
-        - Le modèle : GARCH(1,1) avec moyenne nulle (modèle AR est traité
-          séparément dans garch.py, ici on vise uniquement sigma_t).
-
-    Unité de sigma_{i,t} : même unité que monthly (log-rendement décimal).
-
-    En cas d'échec du GARCH, fallback sur l'écart-type empirique de la fenêtre.
-
-    Paramètres
-    ----------
-    monthly   : pd.DataFrame — log-rendements mensuels complets (pré-OOS inclus)
-    oos_dates : pd.DatetimeIndex — dates OOS (2000-01-31 à 2017-07-31)
-    verbose   : bool
-
     Retourne
     --------
     pd.DataFrame (T_oos × 5) — sigma_{i,t} pour chaque facteur et date OOS
@@ -200,9 +171,14 @@ def _compute_garch_vol_rolling(
                 vols.at[date_t, facteur] = np.nan
                 continue
 
-            # Fenêtre de 60 mois incluse : [t-59 : t] (indexation Python)
-            start = max(0, idx_t - WINDOW_GARCH + 1)
-            window = serie.iloc[start : idx_t + 1]
+            # Prévision ex ante pour t : estimation sur [t-60 : t-1]
+            if idx_t <= 0:
+                vols.at[date_t, facteur] = np.nan
+                continue
+
+            end_prev = idx_t - 1
+            start = max(0, end_prev - WINDOW_GARCH + 1)
+            window = serie.iloc[start : end_prev + 1]
 
             if len(window) < 10:
                 vols.at[date_t, facteur] = float(window.std()) if len(window) > 1 else np.nan
@@ -212,7 +188,7 @@ def _compute_garch_vol_rolling(
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    # Entrée en log-rendements décimaux (ex. 0.034)
+                    # Entrée en rendements simples décimaux (ex. 0.034)
                     # arch_model est plus stable si on rescale en % ou bps
                     # On passe en pourcentage pour la stabilité numérique de arch,
                     # puis on divise le résultat par 100 pour revenir en décimal
@@ -226,9 +202,11 @@ def _compute_garch_vol_rolling(
                         rescale=False,
                     )
                     result = model.fit(disp="off", show_warning=False)
-                    # conditional_volatility est en % (même unité que l'input)
-                    sigma_pct = float(result.conditional_volatility.iloc[-1])
-                    sigma_t   = sigma_pct / 100.0  # retour en décimal
+                    # Prévision 1-step ahead de la variance conditionnelle, en %^2
+                    forecast_var_pct2 = float(
+                        result.forecast(horizon=1, reindex=False).variance.values[-1, 0]
+                    )
+                    sigma_t = np.sqrt(forecast_var_pct2) / 100.0
                     vols.at[date_t, facteur] = sigma_t
                     n_success += 1
 
@@ -257,9 +235,6 @@ def _corr_row_to_matrix(row: pd.Series) -> np.ndarray:
 
     Les corrélations DCC/ADCC/GAS utilisent 'MKT_RF' pour le facteur de marché.
     On mappe MKT_RF → MKT (premier élément de FACTEURS).
-
-    En cas de valeur manquante ou de matrice non-PSD, on projette sur le cône
-    des matrices semi-définies positives (correction spectrale minimale).
     """
     N = len(FACTEURS)
     R = np.eye(N)
@@ -333,28 +308,14 @@ def _mv_longonly(
     """
     Portefeuille tangent long-only par maximisation directe du Sharpe ratio.
 
-    Problème (équation (11) du papier) :
-        max_w  (w' mu - rf) / sqrt(w' Sigma w)
-        s.t.   w' 1 = 1,  w_i >= 0   (long-only, Panel B)
-
-    Stratégie multi-départ : 5 points d'initialisation (équipondéré + 4
-    concentrations unitaires) pour éviter les optima locaux avec N=5.
-
-    Paramètres
-    ----------
-    mu    : np.ndarray (N,) — rendements attendus des facteurs
-    Sigma : np.ndarray (N,N) — matrice de covariance
-    rf    : float — taux sans risque mensuel (log-rendement)
-
     Retourne
     --------
     (w_tangent, sharpe_tangent) : np.ndarray (N,), float
     """
     N = len(mu)
-    excess = mu - rf
 
     def neg_sharpe(w):
-        ret = float(w @ excess)
+        ret = float(w @ mu)
         var = float(w @ Sigma @ w)
         if var < 1e-14:
             return 1e6
@@ -404,33 +365,15 @@ def _mv_130_30(
     """
     Portefeuille tangent 130/30 par maximisation directe du Sharpe ratio.
 
-    Stratégie 130/30 (papier, note 11) :
-        - Exposition longue totale : sum(l) = 1.30
-        - Exposition courte totale : sum(s) = 0.30
-        - Exposition nette         : sum(w) = sum(l) - sum(s) = 1.00
-
-    Reformulation : variables x = [l, s] avec w = l - s, l >= 0, s >= 0.
-
-    Problème :
-        max_x  ((l-s)' mu - rf) / sqrt((l-s)' Sigma (l-s))
-        s.t.   sum(l) = 1.30,  sum(s) = 0.30,  l >= 0,  s >= 0
-
-    Paramètres
-    ----------
-    mu    : np.ndarray (N,)  — rendements attendus
-    Sigma : np.ndarray (N,N) — matrice de covariance
-    rf    : float            — taux sans risque mensuel
-
     Retourne
     --------
     (w_tangent, sharpe_tangent) : np.ndarray (N,), float
     """
     N      = len(mu)
-    excess = mu - rf
 
     def neg_sharpe_130(x):
         w   = x[:N] - x[N:]
-        ret = float(w @ excess)
+        ret = float(w @ mu)
         var = float(w @ Sigma @ w)
         if var < 1e-14:
             return 1e6
@@ -495,14 +438,11 @@ def _compute_benchmark_1N(
     """
     Portefeuille équipondéré 1/N (Panel A du papier, Table 8).
     Poids constants : w_i = 1/5 pour chaque facteur.
-    Rendement réalisé à chaque date : r_p,t = (1/5) * sum_i r_{i,t}
     """
     N = len(FACTEURS)
     w = np.ones(N) / N
 
     r_realized = monthly_oos[FACTEURS].values @ w  # (T,)
-    rf_arr     = rf_oos.reindex(monthly_oos.index).fillna(0.0).values
-
     weights_df = pd.DataFrame(
         data=np.tile(w, (len(monthly_oos), 1)),
         index=monthly_oos.index,
@@ -548,7 +488,7 @@ def run_mv_optimization(verbose: bool = True) -> tuple[dict, pd.DatetimeIndex, p
     rf_series = _charger_rf()
 
     # Période OOS : 2000-01-31 à 2017-07-31
-    masque_oos  = (monthly.index >= OOS_START) & (monthly.index <= OOS_END)
+    masque_oos  = (monthly.index >= OOS_START_BOUND) & (monthly.index <= OOS_END_BOUND)
     monthly_oos = monthly.loc[masque_oos].copy()
     rf_oos      = rf_series.reindex(monthly_oos.index).fillna(0.0)
     oos_dates   = monthly_oos.index
@@ -689,17 +629,11 @@ def _compute_metrics(
     Calcule les métriques de performance d'un portefeuille.
 
     Métriques (Table 8 du papier) :
-        - Annualized return (%)    : expm1(mean_monthly * 12) * 100
-        - Sharpe ratio (annualisé) : mean(excess) / std(excess) * sqrt(12)
-        - Sortino ratio (annualisé): mean(excess) / std(excess_negatif) * sqrt(12)
+        - Annualized return (%)    : mean_monthly * 12 * 100
+        - Sharpe ratio (annualisé) : mean(return) / std(return) * sqrt(12)
+        - Sortino ratio (annualisé): mean(return) / std(return_negatif) * sqrt(12)
         - MDD (%)                  : Maximum Drawdown sur la valeur cumulée
         - Weights (mean)           : poids moyens par facteur sur la période
-
-    Paramètres
-    ----------
-    returns : pd.Series — rendements mensuels réalisés du portefeuille
-    rf      : pd.Series — taux sans risque mensuel
-    weights : pd.DataFrame — poids du portefeuille par date
 
     Retourne
     --------
@@ -709,27 +643,24 @@ def _compute_metrics(
     if len(r) < 2:
         return {}
 
-    rf_aligned = rf.reindex(r.index).fillna(0.0)
-    excess     = r - rf_aligned
-
-    # Rendement annualisé (log-rendement -> rendement simple)
+    # Rendement annualisé en convention arithmétique sur rendements simples
     mean_monthly   = float(r.mean())
-    ann_return_pct = float(np.expm1(mean_monthly * 12)) * 100.0
+    ann_return_pct = mean_monthly * 12.0 * 100.0
 
-    # Sharpe ratio annualisé
-    std_excess = float(excess.std(ddof=1))
-    sharpe     = float(excess.mean() / std_excess) * np.sqrt(12) if std_excess > 0 else np.nan
+    # Sharpe ratio annualisé sans soustraction du taux sans risque
+    std_r  = float(r.std(ddof=1))
+    sharpe = float(r.mean() / std_r) * np.sqrt(12) if std_r > 0 else np.nan
 
-    # Sortino ratio annualisé (dénominateur = volatilité des excès négatifs)
-    neg_excess  = excess[excess < 0]
-    std_neg     = float(neg_excess.std(ddof=1)) if len(neg_excess) > 1 else np.nan
-    sortino     = float(excess.mean() / std_neg) * np.sqrt(12) if (std_neg and std_neg > 0) else np.nan
+    # Sortino ratio annualisé sans soustraction du taux sans risque
+    neg_r    = r[r < 0]
+    std_neg  = float(neg_r.std(ddof=1)) if len(neg_r) > 1 else np.nan
+    sortino  = float(r.mean() / std_neg) * np.sqrt(12) if (std_neg and std_neg > 0) else np.nan
 
-    # Maximum Drawdown (sur la valeur de portefeuille cumulée)
-    cum_value = np.exp(r.cumsum())
+    # Maximum Drawdown sur la valeur cumulée d'un portefeuille en rendements simples
+    cum_value = (1.0 + r).cumprod()
     roll_max  = cum_value.cummax()
     drawdowns = (cum_value - roll_max) / roll_max
-    mdd_pct   = float(drawdowns.min()) * 100.0
+    mdd_pct   = -float(drawdowns.min()) * 100.0
 
     # Poids moyens sur la période OOS
     mean_weights = weights.reindex(r.index).mean()
